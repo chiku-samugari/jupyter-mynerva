@@ -178,6 +178,32 @@ async function fetchBedrockModels(
   return data.models;
 }
 
+interface IFetchUrlResult {
+  url: string;
+  status: number;
+  contentType: string;
+  content: string;
+}
+
+async function fetchUrl(targetUrl: string): Promise<IFetchUrlResult> {
+  const settings = ServerConnection.makeSettings();
+  const url = `${settings.baseUrl}jupyter-mynerva/fetch-url`;
+  const response = await ServerConnection.makeRequest(
+    url,
+    {
+      method: 'POST',
+      body: JSON.stringify({ url: targetUrl })
+    },
+    settings
+  );
+
+  if (!response.ok) {
+    const data = await response.json();
+    throw new Error(data.error || `Fetch failed (${response.status})`);
+  }
+  return response.json();
+}
+
 interface IStreamCallbacks {
   onContentBlockStart: (
     contentType: string,
@@ -863,6 +889,7 @@ const QUERY_ACTION_TYPES = [
   'getSectionFromFile',
   'getCellsFromFile',
   'getOutputFromFile',
+  'fetchUrl',
   'listHelp',
   'help'
 ];
@@ -1236,6 +1263,11 @@ function MynervaComponent({
   const [fileAutoApproved, setFileAutoApproved] = React.useState<
     Map<string, Set<string>>
   >(new Map());
+  // Auto-approval for fetchUrl, keyed by URL origin (scheme://host[:port]).
+  // fetchUrl is currently the only URL-keyed action, so a flat Set suffices.
+  const [urlAutoApproved, setUrlAutoApproved] = React.useState<Set<string>>(
+    new Set()
+  );
   // Session management
   const [sessionId, setSessionId] = React.useState<string | null>(null);
   const [sessions, setSessions] = React.useState<ISessionSummary[]>([]);
@@ -1460,6 +1492,27 @@ function MynervaComponent({
         );
         break;
       }
+      case 'fetchUrl': {
+        try {
+          const fetched = await fetchUrl(action.url);
+          result = JSON.stringify(
+            { type: 'fetchUrl', result: fetched },
+            null,
+            2
+          );
+        } catch (e) {
+          result = JSON.stringify(
+            {
+              type: 'fetchUrl',
+              url: action.url,
+              error: e instanceof Error ? e.message : String(e)
+            },
+            null,
+            2
+          );
+        }
+        break;
+      }
       default:
         result = JSON.stringify(
           { type: 'unknown', error: 'Unknown action type' },
@@ -1590,7 +1643,27 @@ function MynervaComponent({
     return (action as { path: string }).path;
   };
 
+  // Origin = scheme://host[:port]. Anything not parseable as a URL falls
+  // back to the raw string so a bogus URL still gets its own bucket
+  // (and won't accidentally collide with a real origin).
+  const getUrlOrigin = (url: string): string => {
+    try {
+      return new URL(url).origin;
+    } catch {
+      return url;
+    }
+  };
+
   const addAutoApproval = (action: IAction) => {
+    if (action.type === 'fetchUrl') {
+      const origin = getUrlOrigin(action.url);
+      setUrlAutoApproved(prev => {
+        const next = new Set(prev);
+        next.add(origin);
+        return next;
+      });
+      return;
+    }
     if (isFileQueryAction(action)) {
       const targetPath = getFileQueryTargetPath(action);
       setFileAutoApproved(prev => {
@@ -1613,6 +1686,9 @@ function MynervaComponent({
   };
 
   const isActionAutoApproved = (action: IAction): boolean => {
+    if (action.type === 'fetchUrl') {
+      return urlAutoApproved.has(getUrlOrigin(action.url));
+    }
     if (isFileQueryAction(action)) {
       const targetPath = getFileQueryTargetPath(action);
       const approved = fileAutoApproved.get(targetPath);
@@ -1822,7 +1898,7 @@ function MynervaComponent({
       }
       // If not all auto-approvable, do nothing (show buttons for all)
     }
-  }, [messages, autoApproved, fileAutoApproved]);
+  }, [messages, autoApproved, fileAutoApproved, urlAutoApproved]);
 
   const clearStreamingState = () => {
     setStreamingContent('');

@@ -68,6 +68,16 @@ const ACTION_DETAILS: Record<string, IActionDetail> = {
     optional: [],
     usesQuery: true
   },
+  fetchUrl: {
+    description:
+      'Fetch a public web URL (http/https). Returns the raw response body up to 2MB. ' +
+      'The user approves each URL individually; "Share & Always" auto-approves the same origin. ' +
+      'No privacy filter is applied to fetched content: a public URL is public by definition, ' +
+      'and filtering would mangle legitimately useful content (e.g. example IPs in a networking tutorial).',
+    required: ['url'],
+    optional: [],
+    usesQuery: false
+  },
   insertCell: {
     description: 'Insert new cell',
     required: ['position', 'cellType', 'source'],
@@ -152,6 +162,13 @@ Query (other files) - results include "path":
   - getSectionFromFile: { "path": "file.ipynb", "query": {...} } - Get cells under matched heading
   - getCellsFromFile: { "path": "file.ipynb", "query": {...}, "count": N } - Get cell range
   - getOutputFromFile: { "path": "file.ipynb", "query": {...} } - Get output of matched cell
+
+Web fetch:
+  - fetchUrl: { "url": "https://..." } - Fetch a public web URL (http/https only).
+    Returns { url, status, contentType, content }. Body capped at 2MB.
+    The user approves each URL; "Share & Always" auto-approves the same origin.
+    Content is sent verbatim (no privacy filter) because public URLs are public
+    by definition.
 
 Mutate (active notebook):
   - insertCell: { "position": {...} or "end", "cellType": "code"|"markdown", "source": "..." } - Insert new cell

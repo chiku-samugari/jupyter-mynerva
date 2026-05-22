@@ -43,6 +43,11 @@ const ACTION_SCHEMAS: Record<
     required: ['path', 'query'],
     optional: []
   },
+  // Web fetch
+  fetchUrl: {
+    required: ['url'],
+    optional: []
+  },
   // Mutate actions
   insertCell: {
     required: ['position', 'cellType', 'source'],
