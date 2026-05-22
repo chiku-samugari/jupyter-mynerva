@@ -3,6 +3,7 @@ import logging
 import os
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 from cryptography.fernet import Fernet
 
@@ -24,6 +25,9 @@ from jupyter_mynerva.routes import (
     _build_providers_with_models,
     OpenAIModelsHandler,
     BedrockModelsHandler,
+    FetchUrlHandler,
+    fetch_url_safely,
+    _validate_fetch_url,
     _NotebookStore,
     _convert_messages_for_responses_api,
     _build_anthropic_params,
@@ -1797,4 +1801,313 @@ def test_get_default_config_multi_provider_with_explicit(monkeypatch):
 
     defaults = get_default_config()
     assert defaults['provider'] == 'bedrock'
+
+
+# --- _validate_fetch_url ---
+
+def _stub_getaddrinfo(mapping):
+    """Build a fake socket.getaddrinfo that maps host -> [ip, ...].
+
+    Unknown hosts raise socket.gaierror (matching real behavior).
+    """
+    import socket as _socket
+
+    def _fn(host, port, *args, **kwargs):
+        if host not in mapping:
+            raise _socket.gaierror(-2, f'No address for {host!r}')
+        return [
+            (_socket.AF_INET, _socket.SOCK_STREAM, 0, '', (ip, port or 0))
+            for ip in mapping[host]
+        ]
+
+    return _fn
+
+
+def test_validate_fetch_url_rejects_unsupported_scheme():
+    with pytest.raises(ValueError, match='Only http'):
+        _validate_fetch_url('file:///etc/passwd')
+    with pytest.raises(ValueError, match='Only http'):
+        _validate_fetch_url('gopher://example.com/')
+    with pytest.raises(ValueError, match='Only http'):
+        _validate_fetch_url('data:text/plain,hello')
+
+
+def test_validate_fetch_url_rejects_missing_host():
+    with pytest.raises(ValueError, match='no hostname'):
+        _validate_fetch_url('http:///path')
+
+
+def test_validate_fetch_url_rejects_loopback(monkeypatch):
+    monkeypatch.setattr('jupyter_mynerva.routes.socket.getaddrinfo',
+                        _stub_getaddrinfo({'localhost': ['127.0.0.1']}))
+    with pytest.raises(ValueError, match='private/local'):
+        _validate_fetch_url('http://localhost/admin')
+
+
+def test_validate_fetch_url_rejects_literal_ipv4_loopback(monkeypatch):
+    monkeypatch.setattr('jupyter_mynerva.routes.socket.getaddrinfo',
+                        _stub_getaddrinfo({'127.0.0.1': ['127.0.0.1']}))
+    with pytest.raises(ValueError, match='private/local'):
+        _validate_fetch_url('http://127.0.0.1:8080/')
+
+
+def test_validate_fetch_url_rejects_rfc1918(monkeypatch):
+    monkeypatch.setattr('jupyter_mynerva.routes.socket.getaddrinfo',
+                        _stub_getaddrinfo({'internal.lan': ['10.0.0.5']}))
+    with pytest.raises(ValueError, match='private/local'):
+        _validate_fetch_url('http://internal.lan/secret')
+
+
+def test_validate_fetch_url_rejects_link_local_aws_imds(monkeypatch):
+    """AWS IMDS endpoint must never be reachable via fetchUrl."""
+    monkeypatch.setattr('jupyter_mynerva.routes.socket.getaddrinfo',
+                        _stub_getaddrinfo({'169.254.169.254': ['169.254.169.254']}))
+    with pytest.raises(ValueError, match='private/local'):
+        _validate_fetch_url('http://169.254.169.254/latest/meta-data/')
+
+
+def test_validate_fetch_url_rejects_when_any_resolved_ip_is_private(monkeypatch):
+    """Belt-and-suspenders: even if one resolved IP is public, reject if any
+    sibling IP is private. Blocks the trivial multi-A-record bypass."""
+    monkeypatch.setattr('jupyter_mynerva.routes.socket.getaddrinfo',
+                        _stub_getaddrinfo({'tricky.example.com': ['93.184.216.34', '10.0.0.5']}))
+    with pytest.raises(ValueError, match='private/local'):
+        _validate_fetch_url('https://tricky.example.com/')
+
+
+def test_validate_fetch_url_rejects_unknown_host(monkeypatch):
+    monkeypatch.setattr('jupyter_mynerva.routes.socket.getaddrinfo',
+                        _stub_getaddrinfo({}))
+    with pytest.raises(ValueError, match='Cannot resolve'):
+        _validate_fetch_url('https://nonexistent.example/')
+
+
+def test_validate_fetch_url_allows_public_ipv4(monkeypatch):
+    monkeypatch.setattr('jupyter_mynerva.routes.socket.getaddrinfo',
+                        _stub_getaddrinfo({'example.com': ['93.184.216.34']}))
+    _validate_fetch_url('https://example.com/path')
+
+
+# --- fetch_url_safely ---
+
+class _FakeFetchResponse:
+    """Mimics the response yielded by httpx.AsyncClient.stream(...)."""
+    def __init__(self, status_code=200, body=b'', headers=None):
+        self.status_code = status_code
+        self._body = body
+        self.headers = headers or {}
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        return False
+
+    async def aiter_bytes(self):
+        if not self._body:
+            return
+        mid = max(1, len(self._body) // 2)
+        yield self._body[:mid]
+        yield self._body[mid:]
+
+
+class _FakeFetchClient:
+    """Stand-in for httpx.AsyncClient — sequence of responses, one per stream call."""
+    def __init__(self, responses, captured):
+        self._responses = list(responses)
+        self._captured = captured
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        return False
+
+    def stream(self, method, url):
+        self._captured.setdefault('urls', []).append(url)
+        self._captured['method'] = method
+        return self._responses.pop(0)
+
+
+@pytest.mark.asyncio
+async def test_fetch_url_safely_success(monkeypatch):
+    monkeypatch.setattr('jupyter_mynerva.routes.socket.getaddrinfo',
+                        _stub_getaddrinfo({'example.com': ['93.184.216.34']}))
+    captured = {}
+    response = _FakeFetchResponse(
+        status_code=200,
+        body=b'<html>Hello</html>',
+        headers={'content-type': 'text/html; charset=utf-8'},
+    )
+    with patch('jupyter_mynerva.routes.httpx.AsyncClient',
+               return_value=_FakeFetchClient([response], captured)):
+        content, status, ctype = await fetch_url_safely('https://example.com/')
+
+    assert content == '<html>Hello</html>'
+    assert status == 200
+    assert ctype == 'text/html; charset=utf-8'
+    assert captured['urls'] == ['https://example.com/']
+    assert captured['method'] == 'GET'
+
+
+@pytest.mark.asyncio
+async def test_fetch_url_safely_uses_charset_from_content_type(monkeypatch):
+    monkeypatch.setattr('jupyter_mynerva.routes.socket.getaddrinfo',
+                        _stub_getaddrinfo({'example.jp': ['8.8.8.8']}))
+    response = _FakeFetchResponse(
+        status_code=200,
+        body='こんにちは'.encode('shift_jis'),
+        headers={'content-type': 'text/html; charset=shift_jis'},
+    )
+    with patch('jupyter_mynerva.routes.httpx.AsyncClient',
+               return_value=_FakeFetchClient([response], {})):
+        content, _, _ = await fetch_url_safely('https://example.jp/')
+
+    assert content == 'こんにちは'
+
+
+@pytest.mark.asyncio
+async def test_fetch_url_safely_size_cap(monkeypatch):
+    monkeypatch.setattr('jupyter_mynerva.routes.socket.getaddrinfo',
+                        _stub_getaddrinfo({'example.com': ['93.184.216.34']}))
+    monkeypatch.setattr('jupyter_mynerva.routes._FETCH_URL_MAX_BYTES', 16)
+    response = _FakeFetchResponse(
+        status_code=200,
+        body=b'x' * 100,
+        headers={'content-type': 'text/plain'},
+    )
+    with patch('jupyter_mynerva.routes.httpx.AsyncClient',
+               return_value=_FakeFetchClient([response], {})):
+        with pytest.raises(ValueError, match='exceeds 16-byte cap'):
+            await fetch_url_safely('https://example.com/big')
+
+
+@pytest.mark.asyncio
+async def test_fetch_url_safely_follows_redirect(monkeypatch):
+    monkeypatch.setattr('jupyter_mynerva.routes.socket.getaddrinfo',
+                        _stub_getaddrinfo({
+                            'example.com': ['93.184.216.34'],
+                            'final.example.com': ['1.1.1.1'],
+                        }))
+    captured = {}
+    responses = [
+        _FakeFetchResponse(status_code=302, headers={'location': 'https://final.example.com/page'}),
+        _FakeFetchResponse(status_code=200, body=b'final', headers={'content-type': 'text/plain'}),
+    ]
+    with patch('jupyter_mynerva.routes.httpx.AsyncClient',
+               return_value=_FakeFetchClient(responses, captured)):
+        content, status, _ = await fetch_url_safely('https://example.com/old')
+
+    assert content == 'final'
+    assert status == 200
+    assert captured['urls'] == [
+        'https://example.com/old',
+        'https://final.example.com/page',
+    ]
+
+
+@pytest.mark.asyncio
+async def test_fetch_url_safely_rejects_redirect_to_private_ip(monkeypatch):
+    """The classic SSRF bypass: public URL redirects to localhost."""
+    monkeypatch.setattr('jupyter_mynerva.routes.socket.getaddrinfo',
+                        _stub_getaddrinfo({
+                            'example.com': ['93.184.216.34'],
+                            'evil.example.com': ['127.0.0.1'],
+                        }))
+    responses = [
+        _FakeFetchResponse(status_code=302, headers={'location': 'http://evil.example.com/'}),
+    ]
+    with patch('jupyter_mynerva.routes.httpx.AsyncClient',
+               return_value=_FakeFetchClient(responses, {})):
+        with pytest.raises(ValueError, match='private/local'):
+            await fetch_url_safely('https://example.com/bounce')
+
+
+@pytest.mark.asyncio
+async def test_fetch_url_safely_too_many_redirects(monkeypatch):
+    monkeypatch.setattr('jupyter_mynerva.routes.socket.getaddrinfo',
+                        _stub_getaddrinfo({'example.com': ['93.184.216.34']}))
+    monkeypatch.setattr('jupyter_mynerva.routes._FETCH_URL_MAX_REDIRECTS', 2)
+    responses = [
+        _FakeFetchResponse(status_code=302, headers={'location': 'https://example.com/a'}),
+        _FakeFetchResponse(status_code=302, headers={'location': 'https://example.com/b'}),
+        _FakeFetchResponse(status_code=302, headers={'location': 'https://example.com/c'}),
+    ]
+    with patch('jupyter_mynerva.routes.httpx.AsyncClient',
+               return_value=_FakeFetchClient(responses, {})):
+        with pytest.raises(ValueError, match='Too many redirects'):
+            await fetch_url_safely('https://example.com/')
+
+
+@pytest.mark.asyncio
+async def test_fetch_url_safely_redirect_without_location(monkeypatch):
+    monkeypatch.setattr('jupyter_mynerva.routes.socket.getaddrinfo',
+                        _stub_getaddrinfo({'example.com': ['93.184.216.34']}))
+    responses = [_FakeFetchResponse(status_code=302, headers={})]
+    with patch('jupyter_mynerva.routes.httpx.AsyncClient',
+               return_value=_FakeFetchClient(responses, {})):
+        with pytest.raises(ValueError, match='Redirect with no Location'):
+            await fetch_url_safely('https://example.com/broken')
+
+
+# --- FetchUrlHandler ---
+
+def _make_fetch_url_handler(body):
+    h = MagicMock()
+    h.current_user = 'user'
+    h.get_json_body.return_value = body
+    return h
+
+
+@pytest.mark.asyncio
+async def test_fetch_url_handler_success(monkeypatch):
+    async def fake_fetch(url):
+        return 'hello', 200, 'text/html'
+    monkeypatch.setattr('jupyter_mynerva.routes.fetch_url_safely', fake_fetch)
+    handler = _make_fetch_url_handler({'url': 'https://example.com/'})
+
+    await FetchUrlHandler.post(handler)
+
+    written = handler.finish.call_args[0][0]
+    body = json.loads(written)
+    assert body == {
+        'url': 'https://example.com/',
+        'status': 200,
+        'contentType': 'text/html',
+        'content': 'hello',
+    }
+    handler.set_status.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_fetch_url_handler_missing_url():
+    handler = _make_fetch_url_handler({})
+    await FetchUrlHandler.post(handler)
+    handler.set_status.assert_called_once_with(400)
+    body = json.loads(handler.finish.call_args[0][0])
+    assert 'url is required' in body['error']
+
+
+@pytest.mark.asyncio
+async def test_fetch_url_handler_validation_error_returns_400(monkeypatch):
+    async def fake_fetch(url):
+        raise ValueError('private/local IP')
+    monkeypatch.setattr('jupyter_mynerva.routes.fetch_url_safely', fake_fetch)
+    handler = _make_fetch_url_handler({'url': 'http://127.0.0.1/'})
+    await FetchUrlHandler.post(handler)
+    handler.set_status.assert_called_once_with(400)
+    body = json.loads(handler.finish.call_args[0][0])
+    assert 'private/local IP' in body['error']
+
+
+@pytest.mark.asyncio
+async def test_fetch_url_handler_transport_error_returns_502(monkeypatch):
+    async def fake_fetch(url):
+        raise httpx.ConnectError('host unreachable')
+    monkeypatch.setattr('jupyter_mynerva.routes.fetch_url_safely', fake_fetch)
+    handler = _make_fetch_url_handler({'url': 'https://example.com/'})
+    await FetchUrlHandler.post(handler)
+    handler.set_status.assert_called_once_with(502)
+    body = json.loads(handler.finish.call_args[0][0])
+    assert 'host unreachable' in body['error']
 

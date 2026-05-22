@@ -1,10 +1,12 @@
 import fnmatch
 import functools
+import ipaddress
 import json
 import logging
 import os
 import re
 import shutil
+import socket
 import subprocess
 import tempfile
 import urllib.error
@@ -1243,6 +1245,139 @@ class BedrockModelsHandler(APIHandler):
         self.finish(json.dumps({'models': models}))
 
 
+# --- fetchUrl action ---
+#
+# Public-URL fetcher for the LLM's `fetchUrl` action. The threat we defend
+# against is SSRF: the LLM (or a tampered system prompt) tricks the server
+# into fetching internal services like http://localhost:8000/admin or the
+# AWS IMDS endpoint at http://169.254.169.254/. We mitigate by resolving
+# the URL's host ourselves with getaddrinfo, rejecting if any resolved IP
+# is loopback / link-local / RFC1918 / multicast / reserved / unspecified,
+# and re-validating each redirect hop.
+#
+# A residual TOCTOU window exists between our DNS resolution and httpx's
+# connect-time resolution (DNS rebinding attack). Fully closing it would
+# require connecting to the literal IP while preserving SNI + Host for
+# TLS, which is heavyweight in httpx. We accept this small window because
+# (a) the user must approve each URL, (b) the LLM doesn't control DNS for
+# arbitrary hosts, (c) production SSRF guards in most frameworks use the
+# same validate-then-fetch approach. If a deployment needs strict pinning,
+# a follow-up can replace the AsyncClient with a custom transport.
+
+_FETCH_URL_MAX_BYTES = 2 * 1024 * 1024  # 2 MB
+_FETCH_URL_TIMEOUT = 10  # seconds
+_FETCH_URL_MAX_REDIRECTS = 3
+
+
+def _validate_fetch_url(url):
+    """Parse URL, resolve host, reject any private/local resolved IP.
+
+    Raises ValueError with a user-facing message on rejection.
+    """
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in ('http', 'https'):
+        raise ValueError(
+            f'Only http(s) URLs allowed, got scheme {parsed.scheme!r}')
+    host = parsed.hostname
+    if not host:
+        raise ValueError('URL has no hostname')
+    try:
+        infos = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+    except socket.gaierror as e:
+        raise ValueError(f'Cannot resolve host {host!r}: {e}')
+
+    seen_ips = sorted({info[4][0] for info in infos})
+    if not seen_ips:
+        raise ValueError(f'No usable IP for host {host!r}')
+
+    for ip_str in seen_ips:
+        try:
+            ip = ipaddress.ip_address(ip_str)
+        except ValueError:
+            raise ValueError(f'Unparseable resolved IP {ip_str!r} for {host!r}')
+        if (ip.is_loopback or ip.is_link_local or ip.is_private
+                or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
+            raise ValueError(
+                f'Refusing to fetch {host!r}: resolves to '
+                f'{ip_str} (private/local/reserved)')
+
+
+def _decode_response_bytes(content_bytes, content_type):
+    """Decode response body using charset from Content-Type, falling back to utf-8."""
+    charset = 'utf-8'
+    if 'charset=' in content_type.lower():
+        charset = content_type.lower().split('charset=', 1)[1].split(';')[0].strip()
+    try:
+        return content_bytes.decode(charset, errors='replace')
+    except LookupError:
+        return content_bytes.decode('utf-8', errors='replace')
+
+
+async def fetch_url_safely(url):
+    """Fetch URL with SSRF validation, size cap, and per-redirect re-validation.
+
+    Returns (content_str, status_code, content_type). Raises ValueError for
+    user-facing reasons (validation failure, oversize, too many redirects)
+    and httpx.HTTPError for transport-layer failures.
+    """
+    current_url = url
+    async with httpx.AsyncClient(
+        timeout=_FETCH_URL_TIMEOUT,
+        follow_redirects=False,
+    ) as client:
+        for _hop in range(_FETCH_URL_MAX_REDIRECTS + 1):
+            _validate_fetch_url(current_url)
+            async with client.stream('GET', current_url) as resp:
+                if resp.status_code in (301, 302, 303, 307, 308):
+                    location = resp.headers.get('location')
+                    if not location:
+                        raise ValueError(
+                            f'Redirect with no Location header from {current_url}')
+                    current_url = str(httpx.URL(current_url).join(location))
+                    continue
+
+                chunks = []
+                total = 0
+                async for chunk in resp.aiter_bytes():
+                    total += len(chunk)
+                    if total > _FETCH_URL_MAX_BYTES:
+                        raise ValueError(
+                            f'Response exceeds {_FETCH_URL_MAX_BYTES}-byte cap')
+                    chunks.append(chunk)
+                content_type = resp.headers.get('content-type', '')
+                content = _decode_response_bytes(b''.join(chunks), content_type)
+                return content, resp.status_code, content_type
+
+        raise ValueError(f'Too many redirects (>{_FETCH_URL_MAX_REDIRECTS})')
+
+
+class FetchUrlHandler(APIHandler):
+    @tornado.web.authenticated
+    async def post(self):
+        data = self.get_json_body()
+        url = data.get('url', '')
+        if not url:
+            self.set_status(400)
+            self.finish(json.dumps({'error': 'url is required'}))
+            return
+        try:
+            content, status, content_type = await fetch_url_safely(url)
+        except ValueError as e:
+            self.set_status(400)
+            self.finish(json.dumps({'error': str(e)}))
+            return
+        except httpx.HTTPError as e:
+            self.set_status(502)
+            self.finish(json.dumps({'error': f'Fetch failed: {e}'}))
+            return
+        self.finish(json.dumps({
+            'url': url,
+            'status': status,
+            'contentType': content_type,
+            'content': content,
+        }))
+
+
 def setup_route_handlers(web_app):
     host_pattern = '.*$'
     base_url = web_app.settings['base_url']
@@ -1252,6 +1387,7 @@ def setup_route_handlers(web_app):
     chat_pattern = url_path_join(base_url, 'jupyter-mynerva', 'chat')
     openai_models_pattern = url_path_join(base_url, 'jupyter-mynerva', 'openai-models')
     bedrock_models_pattern = url_path_join(base_url, 'jupyter-mynerva', 'bedrock-models')
+    fetch_url_pattern = url_path_join(base_url, 'jupyter-mynerva', 'fetch-url')
     sessions_pattern = url_path_join(base_url, 'jupyter-mynerva', 'sessions')
     session_pattern = url_path_join(base_url, 'jupyter-mynerva', 'sessions', '([^/]+)')
     nblibram_pattern = url_path_join(base_url, 'jupyter-mynerva', 'nblibram')
@@ -1263,6 +1399,7 @@ def setup_route_handlers(web_app):
         (chat_pattern, ChatHandler),
         (openai_models_pattern, OpenAIModelsHandler),
         (bedrock_models_pattern, BedrockModelsHandler),
+        (fetch_url_pattern, FetchUrlHandler),
         (sessions_pattern, SessionsHandler),
         (session_pattern, SessionHandler),
         (nblibram_pattern, NblibramHandler),
