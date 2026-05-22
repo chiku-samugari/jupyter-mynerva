@@ -24,11 +24,13 @@ from jupyter_mynerva.routes import (
     _NotebookStore,
     _convert_messages_for_responses_api,
     _build_anthropic_params,
+    _build_bedrock_converse_body,
     _extract_json_content,
     _send_sse,
     sse_serializer,
     chat_openai,
     chat_anthropic,
+    chat_bedrock_converse,
 )
 from jupyter_mynerva.echo_agent import chat_echo
 
@@ -1271,3 +1273,271 @@ async def test_chat_anthropic_unknown_block_type_ignored():
     stops = [p['content_type'] for p in payloads if p['type'] == 'content_block_stop']
     assert starts == ['text']
     assert stops == ['text']
+
+
+# --- chat_bedrock_converse ---
+
+def _encode_es_string_header(name, value):
+    name_b = name.encode('utf-8')
+    value_b = value.encode('utf-8')
+    return (
+        bytes([len(name_b)]) + name_b
+        + bytes([7])
+        + len(value_b).to_bytes(2, 'big') + value_b
+    )
+
+
+def _encode_es_frame(headers, payload):
+    """Build an AWS event-stream frame (zeroed CRCs)."""
+    headers_blob = b''.join(_encode_es_string_header(k, v) for k, v in headers.items())
+    if isinstance(payload, str):
+        payload = payload.encode('utf-8')
+    total_length = 12 + len(headers_blob) + len(payload) + 4
+    return (
+        total_length.to_bytes(4, 'big')
+        + len(headers_blob).to_bytes(4, 'big')
+        + b'\x00\x00\x00\x00'
+        + headers_blob
+        + payload
+        + b'\x00\x00\x00\x00'
+    )
+
+
+class _FakeStreamResponse:
+    def __init__(self, status_code=200, chunks=(), error_body=b''):
+        self.status_code = status_code
+        self._chunks = list(chunks)
+        self._error_body = error_body
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        return False
+
+    async def aread(self):
+        return self._error_body
+
+    async def aiter_bytes(self):
+        for chunk in self._chunks:
+            yield chunk
+
+
+class _FakeAsyncClient:
+    """Stand-in for httpx.AsyncClient(...) — async ctx mgr returning self."""
+    def __init__(self, response, captured):
+        self._response = response
+        self._captured = captured
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        return False
+
+    def stream(self, method, url, headers=None, content=None):
+        self._captured['method'] = method
+        self._captured['url'] = url
+        self._captured['headers'] = headers
+        self._captured['content'] = content
+        return self._response
+
+
+def test_build_bedrock_converse_body_basic():
+    body = _build_bedrock_converse_body(
+        [
+            {'role': 'system', 'content': 'You are helpful.'},
+            {'role': 'system', 'content': 'Be concise.'},
+            {'role': 'user', 'content': 'Hello',
+             'actions': [{'type': 'getToc'}]},
+            {'role': 'assistant', 'content': 'Hi!'},
+        ],
+        model='us.anthropic.claude-haiku-4-5-20251001-v1:0',
+    )
+    assert body['system'] == [
+        {'text': 'You are helpful.'},
+        {'text': 'Be concise.'},
+    ]
+    assert body['inferenceConfig'] == {'maxTokens': 32000}
+    assert body['messages'][0]['role'] == 'user'
+    user_text = body['messages'][0]['content'][0]['text']
+    assert user_text.startswith('Hello')
+    assert '[Actions proposed]' in user_text
+    assert '"getToc"' in user_text
+    assert body['messages'][1] == {'role': 'assistant', 'content': [{'text': 'Hi!'}]}
+    # Claude in model id -> thinking enabled
+    assert body['additionalModelRequestFields'] == {
+        'thinking': {'type': 'enabled', 'budget_tokens': 2000}
+    }
+
+
+def test_build_bedrock_converse_body_no_thinking_for_non_claude():
+    body = _build_bedrock_converse_body(
+        [{'role': 'user', 'content': 'Hi'}],
+        model='meta.llama3-8b-instruct-v1:0',
+    )
+    assert 'additionalModelRequestFields' not in body
+
+
+@pytest.mark.asyncio
+async def test_chat_bedrock_converse_basic_flow():
+    handler = MagicMock()
+    json_text = '{"messages":[{"role":"assistant","content":"Hi there!"}],"actions":[]}'
+
+    # Stream simulates Bedrock Converse: text deltas, block stop, message stop.
+    chunks = [
+        _encode_es_frame(
+            {':event-type': 'contentBlockDelta', ':message-type': 'event'},
+            json.dumps({'delta': {'text': '{"messages":[{"role":"assistant","content":"Hi'}}),
+        ),
+        _encode_es_frame(
+            {':event-type': 'contentBlockDelta', ':message-type': 'event'},
+            json.dumps({'delta': {'text': ' there!"}],"actions":[]}'}}),
+        ),
+        _encode_es_frame(
+            {':event-type': 'contentBlockStop', ':message-type': 'event'},
+            json.dumps({'contentBlockIndex': 0}),
+        ),
+        _encode_es_frame(
+            {':event-type': 'messageStop', ':message-type': 'event'},
+            json.dumps({'stopReason': 'end_turn'}),
+        ),
+    ]
+
+    captured = {}
+    response = _FakeStreamResponse(status_code=200, chunks=chunks)
+    with patch('jupyter_mynerva.routes.httpx.AsyncClient',
+               return_value=_FakeAsyncClient(response, captured)):
+        await chat_bedrock_converse(
+            handler, 'sk-bedrock', 'us-west-2',
+            'us.anthropic.claude-sonnet-4-5-20250929-v1:0',
+            [{'role': 'user', 'content': 'Hi'}],
+        )
+
+    # URL encodes the model ID (colon escaped); points at bedrock-runtime.
+    assert captured['url'] == (
+        'https://bedrock-runtime.us-west-2.amazonaws.com'
+        '/model/us.anthropic.claude-sonnet-4-5-20250929-v1%3A0/converse-stream'
+    )
+    assert captured['method'] == 'POST'
+    assert captured['headers']['Authorization'] == 'Bearer sk-bedrock'
+    assert captured['headers']['Accept'] == 'application/vnd.amazon.eventstream'
+
+    payloads, written = _parse_sse_payloads(handler)
+    types = [p['type'] for p in payloads]
+    assert 'content_block_start' in types
+    assert 'content_block_delta' in types
+    assert 'content_block_stop' in types
+    assert 'message_done' in types
+
+    text_deltas = [p['delta'] for p in payloads
+                   if p['type'] == 'content_block_delta'
+                   and p['content_type'] == 'text']
+    # _extract_json_content extracts the running 'content' field value.
+    assert text_deltas[0] == 'Hi'
+    assert text_deltas[-1] == 'Hi there!'
+
+    done = [p for p in payloads if p['type'] == 'message_done'][0]
+    assert done['text'] == json_text
+    assert done['stop_reason'] == 'end_turn'
+
+    assert written[-1] == 'data: [DONE]\n\n'
+
+
+@pytest.mark.asyncio
+async def test_chat_bedrock_converse_thinking_then_text():
+    handler = MagicMock()
+    chunks = [
+        _encode_es_frame(
+            {':event-type': 'contentBlockDelta', ':message-type': 'event'},
+            json.dumps({'delta': {'reasoningContent': {'text': 'Let me think'}}}),
+        ),
+        _encode_es_frame(
+            {':event-type': 'contentBlockDelta', ':message-type': 'event'},
+            json.dumps({'delta': {'reasoningContent': {'text': ' about this.'}}}),
+        ),
+        # Switch to text block; emitter must close thinking and open text.
+        _encode_es_frame(
+            {':event-type': 'contentBlockDelta', ':message-type': 'event'},
+            json.dumps({'delta': {'text': '{"messages":[{"role":"assistant","content":"Done"}]}'}}),
+        ),
+        _encode_es_frame(
+            {':event-type': 'contentBlockStop', ':message-type': 'event'},
+            json.dumps({}),
+        ),
+        _encode_es_frame(
+            {':event-type': 'messageStop', ':message-type': 'event'},
+            json.dumps({'stopReason': 'end_turn'}),
+        ),
+    ]
+    response = _FakeStreamResponse(status_code=200, chunks=chunks)
+    with patch('jupyter_mynerva.routes.httpx.AsyncClient',
+               return_value=_FakeAsyncClient(response, {})):
+        await chat_bedrock_converse(
+            handler, 'k', 'us-east-1',
+            'us.anthropic.claude-sonnet-4-5-20250929-v1:0',
+            [],
+        )
+
+    payloads, _ = _parse_sse_payloads(handler)
+    starts = [p['content_type'] for p in payloads if p['type'] == 'content_block_start']
+    stops = [p['content_type'] for p in payloads if p['type'] == 'content_block_stop']
+
+    # Thinking opened first, then closed when text starts; text closed at end.
+    assert starts == ['thinking', 'text']
+    assert stops == ['thinking', 'text']
+
+    thinking_deltas = [p['delta'] for p in payloads
+                       if p['type'] == 'content_block_delta'
+                       and p['content_type'] == 'thinking']
+    assert thinking_deltas == ['Let me think', ' about this.']
+
+
+@pytest.mark.asyncio
+async def test_chat_bedrock_converse_http_error():
+    handler = MagicMock()
+    response = _FakeStreamResponse(
+        status_code=404,
+        chunks=[],
+        error_body=b'{"message":"use case not approved"}',
+    )
+    with patch('jupyter_mynerva.routes.httpx.AsyncClient',
+               return_value=_FakeAsyncClient(response, {})):
+        await chat_bedrock_converse(
+            handler, 'k', 'us-east-1',
+            'us.anthropic.claude-haiku-4-5-20251001-v1:0',
+            [],
+        )
+
+    payloads, _ = _parse_sse_payloads(handler)
+    errors = [p for p in payloads if p['type'] == 'error']
+    assert errors
+    assert 'Bedrock Converse error (404)' in errors[0]['error']
+    assert 'use case not approved' in errors[0]['error']
+
+
+@pytest.mark.asyncio
+async def test_chat_bedrock_converse_exception_frame():
+    handler = MagicMock()
+    chunks = [
+        _encode_es_frame(
+            {':message-type': 'exception',
+             ':exception-type': 'ValidationException'},
+            json.dumps({'message': 'bad input'}),
+        ),
+    ]
+    response = _FakeStreamResponse(status_code=200, chunks=chunks)
+    with patch('jupyter_mynerva.routes.httpx.AsyncClient',
+               return_value=_FakeAsyncClient(response, {})):
+        await chat_bedrock_converse(
+            handler, 'k', 'us-east-1',
+            'us.anthropic.claude-haiku-4-5-20251001-v1:0',
+            [],
+        )
+
+    payloads, _ = _parse_sse_payloads(handler)
+    errors = [p for p in payloads if p['type'] == 'error']
+    assert errors
+    assert 'ValidationException' in errors[0]['error']
+    assert 'bad input' in errors[0]['error']
+

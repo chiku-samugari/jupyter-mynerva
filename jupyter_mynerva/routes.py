@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import tempfile
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from datetime import datetime
@@ -15,6 +16,7 @@ from importlib.resources import files
 from pathlib import Path
 
 import cachetools
+import httpx
 
 _log = logging.getLogger(__name__)
 
@@ -28,6 +30,7 @@ from jupyter_server.utils import url_path_join
 import tornado
 
 from .echo_agent import chat_echo
+from .eventstream import EventStreamParser
 
 
 # Lazy import wrappers for heavy SDKs. The actual modules are loaded only on
@@ -64,6 +67,7 @@ def Fernet(*args, **kwargs):
 PROVIDERS = [
     {'id': 'openai', 'displayName': 'OpenAI'},
     {'id': 'anthropic', 'displayName': 'Anthropic'},
+    {'id': 'bedrock', 'displayName': 'Amazon Bedrock (Converse)'},
     {'id': 'enki-gate', 'displayName': 'Enki Gate'}
 ]
 
@@ -141,6 +145,13 @@ if 'MYNERVA_DEFAULT_MODEL' in os.environ:
 
 if 'MYNERVA_OPENAI_BASE_URL' in os.environ:
     _DEFAULT_CONFIG['openai_base_url'] = os.environ['MYNERVA_OPENAI_BASE_URL']
+
+if 'MYNERVA_BEDROCK_API_KEY' in os.environ:
+    _DEFAULT_CONFIG['bedrock_api_key'] = os.environ['MYNERVA_BEDROCK_API_KEY']
+    del os.environ['MYNERVA_BEDROCK_API_KEY']
+
+if 'MYNERVA_BEDROCK_REGION' in os.environ:
+    _DEFAULT_CONFIG['bedrock_region'] = os.environ['MYNERVA_BEDROCK_REGION']
 
 if os.environ.get('MYNERVA_DEFAULTS_ONLY'):
     _DEFAULT_CONFIG['defaults_only'] = True
@@ -289,6 +300,8 @@ def get_default_api_key(provider):
         return _DEFAULT_CONFIG.get('openai_api_key')
     elif provider == 'anthropic':
         return _DEFAULT_CONFIG.get('anthropic_api_key')
+    elif provider == 'bedrock':
+        return _DEFAULT_CONFIG.get('bedrock_api_key')
     return None
 
 
@@ -668,6 +681,125 @@ async def chat_anthropic(handler, api_key, model, messages):
                             'stop_reason': stop_reason or 'end_turn'})
 
 
+def _build_bedrock_converse_body(messages, model):
+    """Build the JSON body for a Bedrock Converse request.
+
+    Folds system messages into the top-level `system` field, wraps each
+    message's content as a [{text}] block, and appends action protocol
+    JSON inline (matching the chat_anthropic convention).
+
+    Extended thinking is enabled only for Claude/Anthropic models, since
+    non-Anthropic Bedrock models reject `additionalModelRequestFields.thinking`.
+    """
+    api_messages = []
+    system_blocks = []
+    for m in messages:
+        role = m.get('role')
+        content = m.get('content', '')
+        actions = m.get('actions')
+        if actions:
+            content += '\n\n[Actions proposed]\n' + json.dumps(actions)
+
+        if role == 'system':
+            system_blocks.append({'text': content})
+        else:
+            api_messages.append({'role': role, 'content': [{'text': content}]})
+
+    body = {
+        'messages': api_messages,
+        'inferenceConfig': {'maxTokens': 32000}
+    }
+    if system_blocks:
+        body['system'] = system_blocks
+
+    model_lower = model.lower()
+    if 'claude' in model_lower or 'anthropic' in model_lower:
+        body['additionalModelRequestFields'] = {
+            'thinking': {'type': 'enabled', 'budget_tokens': 2000}
+        }
+    return body
+
+
+@sse_serializer
+async def chat_bedrock_converse(handler, api_key, region, model, messages):
+    """Serializer for Bedrock Converse Stream API.
+
+    Uses bearer-token auth against bedrock-runtime.{region}.amazonaws.com.
+    Short-term and long-term Bedrock API keys work directly as Bearer
+    tokens, so no AWS SigV4 or boto3 is needed.
+    """
+    body = _build_bedrock_converse_body(messages, model)
+    url = (f'https://bedrock-runtime.{region}.amazonaws.com'
+           f'/model/{urllib.parse.quote(model, safe="")}/converse-stream')
+    req_headers = {
+        'Authorization': f'Bearer {api_key}',
+        'Content-Type': 'application/json',
+        'Accept': 'application/vnd.amazon.eventstream',
+    }
+
+    parser = EventStreamParser()
+    text_accumulated = ''
+    current_block = None
+    stop_reason = 'end_turn'
+
+    async with httpx.AsyncClient(timeout=300) as client:
+        async with client.stream('POST', url, headers=req_headers,
+                                 content=json.dumps(body)) as resp:
+            if resp.status_code != 200:
+                error_body = (await resp.aread()).decode('utf-8', errors='replace')
+                raise ValueError(
+                    f'Bedrock Converse error ({resp.status_code}): {error_body}')
+
+            async for chunk in resp.aiter_bytes():
+                for hdrs, payload in parser.feed(chunk):
+                    if hdrs.get(':message-type') == 'exception':
+                        try:
+                            err = json.loads(payload)
+                            msg = err.get('message', payload.decode('utf-8', errors='replace'))
+                        except json.JSONDecodeError:
+                            msg = payload.decode('utf-8', errors='replace')
+                        exc_type = hdrs.get(':exception-type', 'Exception')
+                        raise ValueError(f'Bedrock Converse {exc_type}: {msg}')
+
+                    event_type = hdrs.get(':event-type')
+                    if event_type == 'contentBlockDelta':
+                        data_obj = json.loads(payload)
+                        delta = data_obj.get('delta', {})
+                        if 'text' in delta:
+                            if current_block != 'text':
+                                if current_block:
+                                    _block_stop(handler, current_block)
+                                _block_start(handler, 'text')
+                                current_block = 'text'
+                            text_accumulated += delta['text']
+                            display = _extract_json_content(text_accumulated)
+                            if display:
+                                _block_delta(handler, 'text', display)
+                        elif 'reasoningContent' in delta:
+                            rc = delta['reasoningContent']
+                            if 'text' in rc:
+                                if current_block != 'thinking':
+                                    if current_block:
+                                        _block_stop(handler, current_block)
+                                    _block_start(handler, 'thinking')
+                                    current_block = 'thinking'
+                                _block_delta(handler, 'thinking', rc['text'])
+                    elif event_type == 'contentBlockStop':
+                        if current_block:
+                            _block_stop(handler, current_block)
+                            current_block = None
+                    elif event_type == 'messageStop':
+                        data_obj = json.loads(payload)
+                        stop_reason = data_obj.get('stopReason', stop_reason)
+
+    if current_block:
+        _block_stop(handler, current_block)
+
+    _send_sse(handler, {'type': 'message_done',
+                        'text': text_accumulated,
+                        'stop_reason': stop_reason})
+
+
 class ChatHandler(APIHandler):
     @tornado.web.authenticated
     async def post(self):
@@ -710,6 +842,18 @@ class ChatHandler(APIHandler):
                 self.finish(json.dumps({'error': 'API key not configured'}))
                 return
             await chat_anthropic(self, api_key, model, messages)
+            return
+
+        if provider == 'bedrock':
+            if not api_key:
+                self.set_status(500)
+                self.finish(json.dumps({'error': 'API key not configured'}))
+                return
+            if config.get('useDefault') or _DEFAULT_CONFIG.get('defaults_only'):
+                region = _DEFAULT_CONFIG.get('bedrock_region', 'us-east-1')
+            else:
+                region = config.get('bedrockRegion', 'us-east-1')
+            await chat_bedrock_converse(self, api_key, region, model, messages)
             return
 
         self.set_status(400)
