@@ -14,6 +14,8 @@ from jupyter_mynerva.routes import (
     resolve_chat_config,
     _fetch_openai_models,
     _openai_models_cache,
+    _fetch_bedrock_models,
+    _bedrock_models_cache,
     _fetch_chat_models,
     _chat_models_cache,
     _filter_models,
@@ -22,6 +24,7 @@ from jupyter_mynerva.routes import (
     _build_providers_with_models,
     OpenAIModelsHandler,
     ProviderModelsHandler,
+    BedrockModelsHandler,
     _NotebookStore,
     _convert_messages_for_responses_api,
     _build_anthropic_params,
@@ -1690,4 +1693,258 @@ async def test_chat_bedrock_converse_exception_frame():
     assert errors
     assert 'ValidationException' in errors[0]['error']
     assert 'bad input' in errors[0]['error']
+
+
+# --- _fetch_bedrock_models ---
+
+class _FakeSyncResponse:
+    def __init__(self, status_code=200, json_data=None, text=''):
+        self.status_code = status_code
+        self._json_data = json_data
+        self.text = text
+
+    def json(self):
+        return self._json_data
+
+
+class _FakeSyncClient:
+    def __init__(self, response, captured=None):
+        self._response = response
+        self._captured = captured if captured is not None else {}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    def get(self, url, headers=None):
+        self._captured['url'] = url
+        self._captured['headers'] = headers
+        return self._response
+
+
+def test_fetch_bedrock_models_filters_active_system_defined():
+    _bedrock_models_cache.clear()
+    captured = {}
+    response = _FakeSyncResponse(
+        status_code=200,
+        json_data={
+            'inferenceProfileSummaries': [
+                # included
+                {'inferenceProfileId': 'us.anthropic.claude-haiku-4-5-20251001-v1:0',
+                 'status': 'ACTIVE', 'type': 'SYSTEM_DEFINED'},
+                # included
+                {'inferenceProfileId': 'us.anthropic.claude-sonnet-4-5-20250929-v1:0',
+                 'status': 'ACTIVE', 'type': 'SYSTEM_DEFINED'},
+                # excluded: APPLICATION_PROFILE (user-created)
+                {'inferenceProfileId': 'user-defined-1',
+                 'status': 'ACTIVE', 'type': 'APPLICATION_PROFILE'},
+                # excluded: INACTIVE
+                {'inferenceProfileId': 'us.anthropic.claude-3-0-legacy-v1:0',
+                 'status': 'INACTIVE', 'type': 'SYSTEM_DEFINED'},
+                # excluded by models.json allow filter (not claude-{sonnet,haiku,opus}-4-*)
+                {'inferenceProfileId': 'us.meta.llama3-70b-instruct-v1:0',
+                 'status': 'ACTIVE', 'type': 'SYSTEM_DEFINED'},
+            ]
+        },
+    )
+    with patch('jupyter_mynerva.routes.httpx.Client',
+               return_value=_FakeSyncClient(response, captured)):
+        models = _fetch_bedrock_models('sk-key', 'us-west-2')
+
+    assert captured['url'] == 'https://bedrock.us-west-2.amazonaws.com/inference-profiles'
+    assert captured['headers']['Authorization'] == 'Bearer sk-key'
+    assert models == [
+        'us.anthropic.claude-haiku-4-5-20251001-v1:0',
+        'us.anthropic.claude-sonnet-4-5-20250929-v1:0',
+    ]
+
+
+def test_fetch_bedrock_models_cache():
+    _bedrock_models_cache.clear()
+    _bedrock_models_cache[('eu-central-1', 'k')] = ['cached-model']
+
+    result = _fetch_bedrock_models('k', 'eu-central-1')
+    assert result == ['cached-model']
+
+
+def test_fetch_bedrock_models_cache_keyed_by_api_key():
+    """Regression guard: swapping the API key against the same region must
+    re-fetch rather than return another user's cached models."""
+    _bedrock_models_cache.clear()
+    _bedrock_models_cache[('us-east-1', 'key-A')] = ['from-A']
+
+    response = _FakeSyncResponse(
+        status_code=200,
+        json_data={'inferenceProfileSummaries': [
+            {'inferenceProfileId': 'us.anthropic.claude-sonnet-4-5-20250929-v1:0',
+             'status': 'ACTIVE', 'type': 'SYSTEM_DEFINED'},
+        ]},
+    )
+    with patch('jupyter_mynerva.routes.httpx.Client',
+               return_value=_FakeSyncClient(response)):
+        result = _fetch_bedrock_models('key-B', 'us-east-1')
+
+    assert result == ['us.anthropic.claude-sonnet-4-5-20250929-v1:0']
+
+
+def test_fetch_bedrock_models_empty_after_filter_raises():
+    _bedrock_models_cache.clear()
+    response = _FakeSyncResponse(
+        status_code=200,
+        json_data={'inferenceProfileSummaries': [
+            {'inferenceProfileId': 'us.meta.llama3-70b-instruct-v1:0',
+             'status': 'ACTIVE', 'type': 'SYSTEM_DEFINED'},
+        ]},
+    )
+    with patch('jupyter_mynerva.routes.httpx.Client',
+               return_value=_FakeSyncClient(response)):
+        with pytest.raises(ValueError, match='No matching inference profiles'):
+            _fetch_bedrock_models('k', 'us-east-1')
+
+
+def test_fetch_bedrock_models_http_error_raises():
+    _bedrock_models_cache.clear()
+    response = _FakeSyncResponse(
+        status_code=403,
+        json_data=None,
+        text='{"message":"not authorized"}',
+    )
+    with patch('jupyter_mynerva.routes.httpx.Client',
+               return_value=_FakeSyncClient(response)):
+        with pytest.raises(ValueError, match=r'Bedrock list-profiles error \(403\).*not authorized'):
+            _fetch_bedrock_models('k', 'us-east-1')
+
+
+# --- BedrockModelsHandler ---
+
+def test_bedrock_models_handler_success(monkeypatch):
+    monkeypatch.setattr('jupyter_mynerva.routes._fetch_bedrock_models',
+                        lambda key, region: ['us.anthropic.claude-haiku-4-5-20251001-v1:0'])
+    handler = _make_models_handler({'region': 'us-east-1', 'apiKey': 'k'})
+
+    BedrockModelsHandler.post(handler)
+
+    written = handler.finish.call_args[0][0]
+    assert json.loads(written) == {
+        'models': ['us.anthropic.claude-haiku-4-5-20251001-v1:0']
+    }
+    handler.set_status.assert_not_called()
+
+
+def test_bedrock_models_handler_missing_key_returns_400():
+    handler = _make_models_handler({'region': 'us-east-1'})
+
+    BedrockModelsHandler.post(handler)
+
+    handler.set_status.assert_called_once_with(400)
+    body = json.loads(handler.finish.call_args[0][0])
+    assert 'apiKey' in body['error']
+
+
+def test_bedrock_models_handler_default_region(monkeypatch):
+    captured = {}
+
+    def fake_fetch(key, region):
+        captured['args'] = (key, region)
+        return ['m']
+
+    monkeypatch.setattr('jupyter_mynerva.routes._fetch_bedrock_models', fake_fetch)
+    handler = _make_models_handler({'apiKey': 'k'})  # no region
+
+    BedrockModelsHandler.post(handler)
+
+    assert captured['args'] == ('k', 'us-east-1')
+
+
+def test_bedrock_models_handler_returns_500_with_error_body(monkeypatch):
+    def fake_fetch(key, region):
+        raise RuntimeError('use case not approved')
+
+    monkeypatch.setattr('jupyter_mynerva.routes._fetch_bedrock_models', fake_fetch)
+    handler = _make_models_handler({'region': 'us-east-1', 'apiKey': 'k'})
+
+    BedrockModelsHandler.post(handler)
+
+    handler.set_status.assert_called_once_with(500)
+    body = json.loads(handler.finish.call_args[0][0])
+    assert 'use case not approved' in body['error']
+
+
+# --- _get_provider_models bedrock admin-default path ---
+
+def test_get_provider_models_bedrock_uses_admin_key_and_region(monkeypatch):
+    monkeypatch.setattr('jupyter_mynerva.routes._DEFAULT_CONFIG', {
+        'bedrock_api_key': 'admin-bedrock',
+        'bedrock_region': 'ap-northeast-1',
+    })
+    captured = {}
+
+    def fake_fetch(key, region):
+        captured['args'] = (key, region)
+        return ['us.anthropic.claude-sonnet-4-5-20250929-v1:0']
+
+    monkeypatch.setattr('jupyter_mynerva.routes._fetch_bedrock_models', fake_fetch)
+
+    result = _get_provider_models('bedrock')
+    assert result == ['us.anthropic.claude-sonnet-4-5-20250929-v1:0']
+    assert captured['args'] == ('admin-bedrock', 'ap-northeast-1')
+
+
+def test_get_provider_models_bedrock_no_key_returns_empty(monkeypatch):
+    monkeypatch.setattr('jupyter_mynerva.routes._DEFAULT_CONFIG', {})
+    assert _get_provider_models('bedrock') == []
+
+
+def test_get_provider_models_bedrock_defaults_region_to_us_east_1(monkeypatch):
+    monkeypatch.setattr('jupyter_mynerva.routes._DEFAULT_CONFIG', {
+        'bedrock_api_key': 'k',
+    })
+    captured = {}
+    monkeypatch.setattr('jupyter_mynerva.routes._fetch_bedrock_models',
+                        lambda key, region: captured.setdefault('region', region) or ['m'])
+
+    _get_provider_models('bedrock')
+    assert captured['region'] == 'us-east-1'
+
+
+# --- get_default_config bedrock-as-default ---
+
+def test_get_default_config_picks_bedrock_when_only_bedrock_configured(monkeypatch):
+    from jupyter_mynerva.routes import get_default_config
+    monkeypatch.setattr('jupyter_mynerva.routes._DEFAULT_CONFIG', {
+        'bedrock_api_key': 'k', 'bedrock_region': 'us-west-2',
+    })
+    monkeypatch.setattr('jupyter_mynerva.routes._get_provider_models',
+                        lambda p: ['us.anthropic.claude-haiku-4-5-20251001-v1:0'])
+
+    defaults = get_default_config()
+    assert defaults['provider'] == 'bedrock'
+    assert defaults['model'] == 'us.anthropic.claude-haiku-4-5-20251001-v1:0'
+    assert defaults['bedrockRegion'] == 'us-west-2'
+
+
+def test_get_default_config_multi_provider_requires_explicit(monkeypatch):
+    from jupyter_mynerva.routes import get_default_config
+    monkeypatch.setattr('jupyter_mynerva.routes._DEFAULT_CONFIG', {
+        'openai_api_key': 'o',
+        'bedrock_api_key': 'b',
+    })
+    # No MYNERVA_DEFAULT_PROVIDER -> None
+    assert get_default_config() is None
+
+
+def test_get_default_config_multi_provider_with_explicit(monkeypatch):
+    from jupyter_mynerva.routes import get_default_config
+    monkeypatch.setattr('jupyter_mynerva.routes._DEFAULT_CONFIG', {
+        'openai_api_key': 'o',
+        'bedrock_api_key': 'b',
+        'provider': 'bedrock',
+    })
+    monkeypatch.setattr('jupyter_mynerva.routes._get_provider_models',
+                        lambda p: ['us.anthropic.claude-haiku-4-5-20251001-v1:0'])
+
+    defaults = get_default_config()
+    assert defaults['provider'] == 'bedrock'
 

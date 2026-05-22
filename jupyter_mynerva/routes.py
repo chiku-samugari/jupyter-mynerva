@@ -182,6 +182,7 @@ _chat_models_cache = cachetools.TTLCache(maxsize=8, ttl=300)
 _PROVIDER_KEY_FIELD = {
     'openai': 'openai_api_key',
     'anthropic': 'anthropic_api_key',
+    'bedrock': 'bedrock_api_key',
 }
 
 
@@ -215,11 +216,12 @@ async def _fetch_chat_models(provider_id, api_key):
     return models
 
 
-async def _get_provider_models(provider_id, api_key='', base_url=''):
+async def _get_provider_models(provider_id, api_key='', base_url='', region=''):
     """Returns model list for the given provider credentials.
 
     OpenAI-compatible custom endpoints return raw /v1/models results.
     Official OpenAI and Anthropic providers apply the models.json filter.
+    For 'bedrock', hits the Bedrock inference-profiles management API.
     """
     if provider_id == 'openai':
         if base_url and not _is_openai_default_base_url(base_url):
@@ -231,6 +233,10 @@ async def _get_provider_models(provider_id, api_key='', base_url=''):
         if not api_key:
             return []
         return await _fetch_chat_models(provider_id, api_key)
+    if provider_id == 'bedrock':
+        if not api_key:
+            return []
+        return _fetch_bedrock_models(api_key, region or 'us-east-1')
     return []
 
 
@@ -238,7 +244,8 @@ async def _get_default_provider_models(provider_id):
     key_field = _PROVIDER_KEY_FIELD.get(provider_id)
     api_key = _DEFAULT_CONFIG.get(key_field, '') if key_field else ''
     base_url = _DEFAULT_CONFIG.get('openai_base_url', '') if provider_id == 'openai' else ''
-    return await _get_provider_models(provider_id, api_key, base_url)
+    region = _DEFAULT_CONFIG.get('bedrock_region', 'us-east-1') if provider_id == 'bedrock' else ''
+    return await _get_provider_models(provider_id, api_key, base_url, region)
 
 
 async def _get_config_provider_models(provider_id, config):
@@ -247,10 +254,54 @@ async def _get_config_provider_models(provider_id, config):
     if provider_id != config.get('provider'):
         return []
     base_url = config.get('openaiBaseUrl', '') if provider_id == 'openai' else ''
-    return await _get_provider_models(provider_id, config['apiKey'], base_url)
+    region = config.get('bedrockRegion', '') if provider_id == 'bedrock' else ''
+    return await _get_provider_models(provider_id, config['apiKey'], base_url, region)
 
 
 _openai_models_cache = cachetools.TTLCache(maxsize=8, ttl=300)
+_bedrock_models_cache = cachetools.TTLCache(maxsize=8, ttl=300)
+
+
+def _fetch_bedrock_models(api_key, region):
+    """Fetch active inference profile IDs from Bedrock management API.
+
+    Hits GET https://bedrock.{region}.amazonaws.com/inference-profiles with
+    bearer-token auth, keeps profiles with status=ACTIVE and
+    type=SYSTEM_DEFINED, then applies the models.json bedrock allow/deny
+    filter so the dropdown stays focused on chat-capable models.
+
+    Sync because model listing is a fast one-shot — unlike chat which is
+    long-lived and must not block the Tornado event loop.
+
+    Bedrock does not expose per-account grant info on this endpoint, so all
+    matching profiles in the region are returned; access failures surface
+    later at Converse invocation time.
+    """
+    cache_key = (region, api_key or '')
+    if cache_key in _bedrock_models_cache:
+        return _bedrock_models_cache[cache_key]
+    url = f'https://bedrock.{region}.amazonaws.com/inference-profiles'
+    headers = {'Authorization': f'Bearer {api_key}'}
+    with httpx.Client(timeout=30) as client:
+        resp = client.get(url, headers=headers)
+    if resp.status_code != 200:
+        raise ValueError(
+            f'Bedrock list-profiles error ({resp.status_code}): {resp.text}')
+    data = resp.json()
+    summaries = data.get('inferenceProfileSummaries', [])
+    candidate_ids = [
+        p['inferenceProfileId']
+        for p in summaries
+        if p.get('status') == 'ACTIVE'
+        and p.get('type') == 'SYSTEM_DEFINED'
+        and p.get('inferenceProfileId')
+    ]
+    spec = _load_model_spec().get('bedrock', {'allow': ['*'], 'deny': []})
+    models = _filter_models(candidate_ids, spec['allow'], spec.get('deny', []))
+    if not models:
+        raise ValueError(f'No matching inference profiles available in {region}')
+    _bedrock_models_cache[cache_key] = models
+    return models
 
 
 async def _fetch_openai_models(api_key, base_url):
@@ -279,29 +330,31 @@ async def get_default_config():
     """Returns default config if available.
 
     - If only one API key (or base_url) is set, auto-select that provider
-    - If both API keys are set, MYNERVA_DEFAULT_PROVIDER is required
+    - If multiple keys are set, MYNERVA_DEFAULT_PROVIDER is required and must
+      name one of the configured providers
     - If model is not specified, use first model from _get_provider_models()
     """
     has_openai = bool(_DEFAULT_CONFIG.get('openai_api_key') or
                       _DEFAULT_CONFIG.get('openai_base_url'))
     has_anthropic = bool(_DEFAULT_CONFIG.get('anthropic_api_key'))
+    has_bedrock = bool(_DEFAULT_CONFIG.get('bedrock_api_key'))
 
-    if not has_openai and not has_anthropic:
+    candidates = [name for name, present in (
+        ('openai', has_openai),
+        ('anthropic', has_anthropic),
+        ('bedrock', has_bedrock),
+    ) if present]
+    if not candidates:
         return None
 
-    # Determine provider
     explicit_provider = _DEFAULT_CONFIG.get('provider')
-    if has_openai and has_anthropic:
-        # Both keys present - require explicit provider
-        if not explicit_provider:
+    if len(candidates) == 1:
+        provider = candidates[0]
+    else:
+        if not explicit_provider or explicit_provider not in candidates:
             return None
         provider = explicit_provider
-    elif has_openai:
-        provider = 'openai'
-    else:
-        provider = 'anthropic'
 
-    # Determine model
     model = _DEFAULT_CONFIG.get('model')
     if not model:
         models = await _get_default_provider_models(provider)
@@ -313,6 +366,8 @@ async def get_default_config():
     }
     if _DEFAULT_CONFIG.get('openai_base_url'):
         result['openaiBaseUrl'] = _DEFAULT_CONFIG['openai_base_url']
+    if _DEFAULT_CONFIG.get('bedrock_region'):
+        result['bedrockRegion'] = _DEFAULT_CONFIG['bedrock_region']
     return result
 
 
@@ -1203,8 +1258,9 @@ class ProviderModelsHandler(APIHandler):
         provider = data['provider']
         api_key = data['apiKey']
         base_url = data['baseUrl'] if provider == 'openai' else ''
+        region = data.get('bedrockRegion', '') if provider == 'bedrock' else ''
 
-        if provider not in ('openai', 'anthropic'):
+        if provider not in ('openai', 'anthropic', 'bedrock'):
             self.set_status(400)
             self.finish(json.dumps({'error': f'Unsupported provider: {provider}'}))
             return
@@ -1217,7 +1273,27 @@ class ProviderModelsHandler(APIHandler):
             self.finish(json.dumps({'error': 'API key is required'}))
             return
 
-        models = await _get_provider_models(provider, api_key, base_url)
+        models = await _get_provider_models(provider, api_key, base_url, region)
+        self.finish(json.dumps({'models': models}))
+
+
+class BedrockModelsHandler(APIHandler):
+    @tornado.web.authenticated
+    def post(self):
+        data = self.get_json_body()
+        api_key = data.get('apiKey')
+        region = data.get('region') or 'us-east-1'
+        if not api_key:
+            self.set_status(400)
+            self.finish(json.dumps({'error': 'apiKey is required'}))
+            return
+        try:
+            models = _fetch_bedrock_models(api_key, region)
+        except Exception as e:
+            _log.warning('Failed to fetch Bedrock models in %s: %s', region, e)
+            self.set_status(500)
+            self.finish(json.dumps({'error': str(e)}))
+            return
         self.finish(json.dumps({'models': models}))
 
 
@@ -1230,6 +1306,7 @@ def setup_route_handlers(web_app):
     chat_pattern = url_path_join(base_url, 'jupyter-mynerva', 'chat')
     openai_models_pattern = url_path_join(base_url, 'jupyter-mynerva', 'openai-models')
     provider_models_pattern = url_path_join(base_url, 'jupyter-mynerva', 'provider-models')
+    bedrock_models_pattern = url_path_join(base_url, 'jupyter-mynerva', 'bedrock-models')
     sessions_pattern = url_path_join(base_url, 'jupyter-mynerva', 'sessions')
     session_pattern = url_path_join(base_url, 'jupyter-mynerva', 'sessions', '([^/]+)')
     nblibram_pattern = url_path_join(base_url, 'jupyter-mynerva', 'nblibram')
@@ -1241,6 +1318,7 @@ def setup_route_handlers(web_app):
         (chat_pattern, ChatHandler),
         (openai_models_pattern, OpenAIModelsHandler),
         (provider_models_pattern, ProviderModelsHandler),
+        (bedrock_models_pattern, BedrockModelsHandler),
         (sessions_pattern, SessionsHandler),
         (session_pattern, SessionHandler),
         (nblibram_pattern, NblibramHandler),
