@@ -50,6 +50,7 @@ interface IConfig {
   apiKey: string;
   useDefault?: boolean;
   openaiBaseUrl?: string;
+  bedrockRegion?: string;
   enkiGateUrl?: string;
   enkiGateToken?: string;
   enkiGateModel?: string;
@@ -60,6 +61,7 @@ interface IDefaultConfig {
   provider: string;
   model: string;
   openaiBaseUrl?: string;
+  bedrockRegion?: string;
 }
 
 interface IProvider {
@@ -154,6 +156,31 @@ async function fetchProviderModels(
 
 function isOpenAIDefaultBaseUrl(baseUrl: string): boolean {
   return baseUrl.trim().replace(/\/+$/, '') === 'https://api.openai.com/v1';
+}
+
+async function fetchBedrockModels(
+  region: string,
+  apiKey: string
+): Promise<string[]> {
+  const settings = ServerConnection.makeSettings();
+  const url = `${settings.baseUrl}jupyter-mynerva/bedrock-models`;
+  const response = await ServerConnection.makeRequest(
+    url,
+    {
+      method: 'POST',
+      body: JSON.stringify({ region, apiKey })
+    },
+    settings
+  );
+
+  if (!response.ok) {
+    const data = await response.json();
+    throw new Error(
+      data.error || `Failed to fetch models (${response.status})`
+    );
+  }
+  const data = await response.json();
+  return data.models;
 }
 
 interface IStreamCallbacks {
@@ -573,6 +600,9 @@ function SettingsView({
   const [openaiBaseUrl, setOpenaiBaseUrl] = React.useState(
     config.openaiBaseUrl || ''
   );
+  const [bedrockRegion, setBedrockRegion] = React.useState(
+    config.bedrockRegion || 'us-east-1'
+  );
   const [customModels, setCustomModels] = React.useState<string[] | null>(null);
   const [fetchingModels, setFetchingModels] = React.useState(false);
   const [saving, setSaving] = React.useState(false);
@@ -584,7 +614,9 @@ function SettingsView({
       ? !!(apiKey || hasOpenAICustomBaseUrl)
       : provider === 'anthropic'
         ? !!apiKey
-        : false;
+        : provider === 'bedrock'
+          ? !!apiKey
+          : false;
 
   const loadModels = async () => {
     if (!canFetchModels) {
@@ -593,11 +625,10 @@ function SettingsView({
     setFetchingModels(true);
     setError('');
     try {
-      const fetched = await fetchProviderModels(
-        provider,
-        apiKey,
-        openaiBaseUrl
-      );
+      const fetched =
+        provider === 'bedrock'
+          ? await fetchBedrockModels(bedrockRegion, apiKey)
+          : await fetchProviderModels(provider, apiKey, openaiBaseUrl);
       setCustomModels(fetched);
       setModel(current =>
         fetched.includes(current) ? current : fetched[0] || ''
@@ -648,7 +679,8 @@ function SettingsView({
         apiKey,
         useDefault,
         openaiBaseUrl:
-          provider === 'openai' && openaiBaseUrl ? openaiBaseUrl : undefined
+          provider === 'openai' && openaiBaseUrl ? openaiBaseUrl : undefined,
+        bedrockRegion: provider === 'bedrock' ? bedrockRegion : undefined
       };
       await saveConfig(newConfig);
       onSave(newConfig);
@@ -676,7 +708,8 @@ function SettingsView({
               onChange={e => setUseDefault(e.target.checked)}
             />
             Use default settings ({defaults.provider} / {defaults.model}
-            {defaults.openaiBaseUrl && ` @ ${defaults.openaiBaseUrl}`})
+            {defaults.openaiBaseUrl && ` @ ${defaults.openaiBaseUrl}`}
+            {defaults.bedrockRegion && ` @ ${defaults.bedrockRegion}`})
           </label>
         </div>
       )}
@@ -718,6 +751,20 @@ function SettingsView({
                     onBlur={handleModelSourceBlur}
                     placeholder="https://api.openai.com/v1"
                   />
+                </div>
+              )}
+              {provider === 'bedrock' && (
+                <div className="jp-Mynerva-settings-field">
+                  <label>AWS Region</label>
+                  <select
+                    value={bedrockRegion}
+                    onChange={e => setBedrockRegion(e.target.value)}
+                  >
+                    <option value="us-east-1">us-east-1</option>
+                    <option value="us-west-2">us-west-2</option>
+                    <option value="eu-central-1">eu-central-1</option>
+                    <option value="ap-northeast-1">ap-northeast-1</option>
+                  </select>
                 </div>
               )}
               <div className="jp-Mynerva-settings-field">
