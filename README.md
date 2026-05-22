@@ -140,6 +140,18 @@ Query actions show a preview before sending to LLM. Users can choose to apply pr
 { "id": "abc123" }        // cell ID
 ```
 
+### Web Fetch
+
+| Action     | Parameters | Description                          |
+| ---------- | ---------- | ------------------------------------ |
+| `fetchUrl` | `url`      | Fetch a public web URL (http/https). |
+
+Returns `{ url, status, contentType, content }`. The response body is capped at 2 MB; up to 3 redirects are followed; each redirect target is re-validated for SSRF. Only `http` and `https` schemes are accepted, and the URL's host must resolve to a public IP — loopback, link-local (including the AWS IMDS endpoint), RFC1918 private ranges, multicast, and reserved ranges are all rejected.
+
+Each URL requires user approval. Choosing "Share & Always" grants the LLM future fetches of the same **origin** (scheme + host + port), parallel to how file queries auto-approve by path.
+
+**No privacy filter is applied to fetched content.** The privacy filter exists to mask outbound leakage of the user's notebook data; web content fetched via `fetchUrl` is public by definition (Mynerva can only reach URLs that anyone else could also reach), so filtering would add no real protection but would degrade legitimately useful content — e.g. masking real example IPs in a networking tutorial would confuse the LLM.
+
 ### Mutate: Active Notebook
 
 | Action       | Parameters                       | Description         |
@@ -209,6 +221,9 @@ Query (other files):
   - getSectionFromFile: { path, query }
   - getCellsFromFile: { path, query, count? }
   - getOutputFromFile: { path, query }
+
+Web fetch:
+  - fetchUrl: { url }
 
 Mutate (requires _hash from prior read):
   - insertCell: { position, cellType, content }
