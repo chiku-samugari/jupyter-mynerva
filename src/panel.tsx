@@ -50,6 +50,7 @@ interface IConfig {
   apiKey: string;
   useDefault?: boolean;
   openaiBaseUrl?: string;
+  bedrockRegion?: string;
   enkiGateUrl?: string;
   enkiGateToken?: string;
   enkiGateModel?: string;
@@ -60,6 +61,7 @@ interface IDefaultConfig {
   provider: string;
   model: string;
   openaiBaseUrl?: string;
+  bedrockRegion?: string;
 }
 
 interface IProvider {
@@ -137,6 +139,31 @@ async function fetchOpenAIModels(
     {
       method: 'POST',
       body: JSON.stringify({ baseUrl, apiKey })
+    },
+    settings
+  );
+
+  if (!response.ok) {
+    const data = await response.json();
+    throw new Error(
+      data.error || `Failed to fetch models (${response.status})`
+    );
+  }
+  const data = await response.json();
+  return data.models;
+}
+
+async function fetchBedrockModels(
+  region: string,
+  apiKey: string
+): Promise<string[]> {
+  const settings = ServerConnection.makeSettings();
+  const url = `${settings.baseUrl}jupyter-mynerva/bedrock-models`;
+  const response = await ServerConnection.makeRequest(
+    url,
+    {
+      method: 'POST',
+      body: JSON.stringify({ region, apiKey })
     },
     settings
   );
@@ -568,6 +595,9 @@ function SettingsView({
   const [openaiBaseUrl, setOpenaiBaseUrl] = React.useState(
     config.openaiBaseUrl || ''
   );
+  const [bedrockRegion, setBedrockRegion] = React.useState(
+    config.bedrockRegion || 'us-east-1'
+  );
   const [customModels, setCustomModels] = React.useState<string[] | null>(null);
   const [fetchingModels, setFetchingModels] = React.useState(false);
   const [saving, setSaving] = React.useState(false);
@@ -587,13 +617,26 @@ function SettingsView({
           setError(e instanceof Error ? e.message : 'Failed to fetch models');
         })
         .finally(() => setFetchingModels(false));
+    } else if (provider === 'bedrock' && apiKey) {
+      setFetchingModels(true);
+      fetchBedrockModels(bedrockRegion, apiKey)
+        .then(fetched => {
+          setCustomModels(fetched);
+          if (!fetched.includes(model)) {
+            setModel(fetched[0]);
+          }
+        })
+        .catch(e => {
+          setError(e instanceof Error ? e.message : 'Failed to fetch models');
+        })
+        .finally(() => setFetchingModels(false));
     }
   }, []);
 
   const currentProvider =
     providers.find(p => p.id === provider) || providers[0];
   const models =
-    provider === 'openai' && customModels
+    (provider === 'openai' || provider === 'bedrock') && customModels
       ? customModels
       : currentProvider?.models || [];
 
@@ -607,6 +650,26 @@ function SettingsView({
   };
 
   const handleFetchModels = async () => {
+    if (provider === 'bedrock') {
+      if (!apiKey) {
+        setError('API key is required to fetch Bedrock models');
+        return;
+      }
+      setFetchingModels(true);
+      setError('');
+      try {
+        const fetched = await fetchBedrockModels(bedrockRegion, apiKey);
+        setCustomModels(fetched);
+        if (!fetched.includes(model)) {
+          setModel(fetched[0]);
+        }
+      } catch (e) {
+        setError(e instanceof Error ? e.message : 'Failed to fetch models');
+      } finally {
+        setFetchingModels(false);
+      }
+      return;
+    }
     if (!openaiBaseUrl) {
       return;
     }
@@ -635,7 +698,8 @@ function SettingsView({
         apiKey,
         useDefault,
         openaiBaseUrl:
-          provider === 'openai' && openaiBaseUrl ? openaiBaseUrl : undefined
+          provider === 'openai' && openaiBaseUrl ? openaiBaseUrl : undefined,
+        bedrockRegion: provider === 'bedrock' ? bedrockRegion : undefined
       };
       await saveConfig(newConfig);
       onSave(newConfig);
@@ -663,7 +727,8 @@ function SettingsView({
               onChange={e => setUseDefault(e.target.checked)}
             />
             Use default settings ({defaults.provider} / {defaults.model}
-            {defaults.openaiBaseUrl && ` @ ${defaults.openaiBaseUrl}`})
+            {defaults.openaiBaseUrl && ` @ ${defaults.openaiBaseUrl}`}
+            {defaults.bedrockRegion && ` @ ${defaults.bedrockRegion}`})
           </label>
         </div>
       )}
@@ -703,6 +768,36 @@ function SettingsView({
                   />
                 </div>
               )}
+              {provider === 'bedrock' && (
+                <div className="jp-Mynerva-settings-field">
+                  <label>AWS Region</label>
+                  <select
+                    value={bedrockRegion}
+                    onChange={e => setBedrockRegion(e.target.value)}
+                  >
+                    <option value="us-east-1">us-east-1 (N. Virginia)</option>
+                    <option value="us-east-2">us-east-2 (Ohio)</option>
+                    <option value="us-west-2">us-west-2 (Oregon)</option>
+                    <option value="ca-central-1">ca-central-1 (Canada)</option>
+                    <option value="sa-east-1">sa-east-1 (São Paulo)</option>
+                    <option value="eu-west-1">eu-west-1 (Ireland)</option>
+                    <option value="eu-west-2">eu-west-2 (London)</option>
+                    <option value="eu-west-3">eu-west-3 (Paris)</option>
+                    <option value="eu-central-1">eu-central-1 (Frankfurt)</option>
+                    <option value="eu-central-2">eu-central-2 (Zurich)</option>
+                    <option value="eu-north-1">eu-north-1 (Stockholm)</option>
+                    <option value="ap-south-1">ap-south-1 (Mumbai)</option>
+                    <option value="ap-southeast-1">ap-southeast-1 (Singapore)</option>
+                    <option value="ap-southeast-2">ap-southeast-2 (Sydney)</option>
+                    <option value="ap-northeast-1">ap-northeast-1 (Tokyo)</option>
+                    <option value="ap-northeast-2">ap-northeast-2 (Seoul)</option>
+                    <option value="me-south-1">me-south-1 (Bahrain)</option>
+                    <option value="af-south-1">af-south-1 (Cape Town)</option>
+                    <option value="me-central-1">me-central-1 (UAE)</option>
+                    <option value="il-central-1">il-central-1 (Tel Aviv)</option>
+                  </select>
+                </div>
+              )}
               <div className="jp-Mynerva-settings-field">
                 <label>API Key</label>
                 <input
@@ -726,7 +821,8 @@ function SettingsView({
                       </option>
                     ))}
                   </select>
-                  {provider === 'openai' && openaiBaseUrl && (
+                  {((provider === 'openai' && openaiBaseUrl) ||
+                    provider === 'bedrock') && (
                     <button
                       onClick={handleFetchModels}
                       disabled={fetchingModels}
