@@ -21,6 +21,7 @@ export type IQueryAction =
   | IGetSectionFromFileAction
   | IGetCellsFromFileAction
   | IGetOutputFromFileAction
+  | IFetchUrlAction
   | IListHelpAction
   | IHelpDetailAction;
 
@@ -85,6 +86,11 @@ export interface IGetOutputFromFileAction {
   type: 'getOutputFromFile';
   path: string;
   query: ICellQuery;
+}
+
+export interface IFetchUrlAction {
+  type: 'fetchUrl';
+  url: string;
 }
 
 export interface IListHelpAction {
