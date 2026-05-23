@@ -241,6 +241,45 @@ async function readPdf(
   return response.json();
 }
 
+interface IReadExcelResult {
+  path: string;
+  sheet: string;
+  totalRows: number;
+  rows: string;
+  headers: string[];
+  data: unknown[][];
+}
+
+async function readExcel(
+  path: string,
+  sheet?: string,
+  rows?: string
+): Promise<IReadExcelResult> {
+  const settings = ServerConnection.makeSettings();
+  const url = `${settings.baseUrl}jupyter-mynerva/read-excel`;
+  const body: Record<string, string> = { path };
+  if (sheet) {
+    body.sheet = sheet;
+  }
+  if (rows) {
+    body.rows = rows;
+  }
+  const response = await ServerConnection.makeRequest(
+    url,
+    {
+      method: 'POST',
+      body: JSON.stringify(body)
+    },
+    settings
+  );
+
+  if (!response.ok) {
+    const data = await response.json();
+    throw new Error(data.error || `Read Excel failed (${response.status})`);
+  }
+  return response.json();
+}
+
 interface IStreamCallbacks {
   onContentBlockStart: (
     contentType: string,
@@ -1536,6 +1575,31 @@ function MynervaComponent({
           result = JSON.stringify(
             {
               type: 'readPdf',
+              path: action.path,
+              error: e instanceof Error ? e.message : String(e)
+            },
+            null,
+            2
+          );
+        }
+        break;
+      }
+      case 'readExcel': {
+        try {
+          const excelResult = await readExcel(
+            action.path,
+            action.sheet,
+            action.rows
+          );
+          result = JSON.stringify(
+            { type: 'readExcel', result: excelResult },
+            null,
+            2
+          );
+        } catch (e) {
+          result = JSON.stringify(
+            {
+              type: 'readExcel',
               path: action.path,
               error: e instanceof Error ? e.message : String(e)
             },

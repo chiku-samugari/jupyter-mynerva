@@ -53,6 +53,11 @@ const ACTION_SCHEMAS: Record<
     required: ['path'],
     optional: ['pages']
   },
+  // Excel reading
+  readExcel: {
+    required: ['path'],
+    optional: ['sheet', 'rows']
+  },
   // Mutate actions
   insertCell: {
     required: ['position', 'cellType', 'source'],

@@ -1515,6 +1515,143 @@ class ReadPdfHandler(APIHandler):
             }))
 
 
+_READ_EXCEL_MAX_ROWS = 1000
+
+
+def _parse_row_range(rows_str, total_rows):
+    """Parse a row range string like "1-100", "5-20" into a list of 0-based indices."""
+    result = []
+    for part in rows_str.split(','):
+        part = part.strip()
+        if '-' in part:
+            start_s, end_s = part.split('-', 1)
+            start = int(start_s)
+            end = int(end_s)
+            if start < 1:
+                raise ValueError(f'Invalid row number: {start}')
+            if end < start:
+                raise ValueError(f'Invalid row range: {start}-{end}')
+            for i in range(start - 1, min(end, total_rows)):
+                if i not in result:
+                    result.append(i)
+        else:
+            r = int(part)
+            if r < 1:
+                raise ValueError(f'Invalid row number: {r}')
+            idx = r - 1
+            if idx < total_rows and idx not in result:
+                result.append(idx)
+    return result
+
+
+class ReadExcelHandler(APIHandler):
+
+    def _validate_path(self, path):
+        """Resolve path against content root. Rejects traversal and hidden files."""
+        root_dir = os.path.realpath(self.contents_manager.root_dir)
+        resolved = os.path.realpath(os.path.join(root_dir, path))
+        if not resolved.startswith(root_dir + os.sep):
+            raise ValueError('path escapes content root')
+        rel = os.path.relpath(resolved, root_dir)
+        for part in rel.split(os.sep):
+            if part.startswith('.'):
+                raise ValueError('hidden files are not accessible')
+        return resolved
+
+    @tornado.web.authenticated
+    def post(self):
+        try:
+            import openpyxl
+        except ImportError:
+            self.set_status(500)
+            self.finish(json.dumps({
+                'error': 'openpyxl is not installed. Run: pip install openpyxl'
+            }))
+            return
+
+        data = self.get_json_body()
+        path = data.get('path', '')
+        if not path:
+            self.set_status(400)
+            self.finish(json.dumps({'error': 'path is required'}))
+            return
+
+        try:
+            resolved = self._validate_path(path)
+        except ValueError as e:
+            self.set_status(400)
+            self.finish(json.dumps({'error': str(e)}))
+            return
+
+        if not os.path.isfile(resolved):
+            self.set_status(404)
+            self.finish(json.dumps({'error': f'File not found: {path}'}))
+            return
+
+        try:
+            wb = openpyxl.load_workbook(resolved, read_only=True, data_only=True)
+        except Exception as e:
+            self.set_status(400)
+            self.finish(json.dumps({'error': f'Failed to open Excel file: {e}'}))
+            return
+
+        try:
+            sheet_name = data.get('sheet', '')
+            if sheet_name:
+                if sheet_name not in wb.sheetnames:
+                    self.set_status(400)
+                    self.finish(json.dumps({
+                        'error': f'Sheet not found: {sheet_name}. Available sheets: {", ".join(wb.sheetnames)}'
+                    }))
+                    return
+                ws = wb[sheet_name]
+            else:
+                ws = wb.active
+                sheet_name = ws.title
+
+            all_rows = []
+            for row in ws.iter_rows(values_only=True):
+                all_rows.append([
+                    v if v is None else str(v) if not isinstance(v, (int, float, bool)) else v
+                    for v in row
+                ])
+
+            total_rows = len(all_rows)
+            rows_str = data.get('rows', '')
+
+            if total_rows > 0:
+                headers = [str(v) if v is not None else '' for v in all_rows[0]]
+            else:
+                headers = []
+
+            if rows_str:
+                try:
+                    row_indices = _parse_row_range(rows_str, total_rows)
+                except ValueError as e:
+                    self.set_status(400)
+                    self.finish(json.dumps({'error': str(e)}))
+                    return
+                selected_rows = [all_rows[i] for i in row_indices]
+                rows_desc = rows_str
+            else:
+                capped = min(total_rows, _READ_EXCEL_MAX_ROWS)
+                selected_rows = all_rows[:capped]
+                rows_desc = f'1-{capped}'
+                if total_rows > _READ_EXCEL_MAX_ROWS:
+                    rows_desc += f' (capped at {_READ_EXCEL_MAX_ROWS} of {total_rows})'
+
+            self.finish(json.dumps({
+                'path': path,
+                'sheet': sheet_name,
+                'totalRows': total_rows,
+                'rows': rows_desc,
+                'headers': headers,
+                'data': selected_rows,
+            }))
+        finally:
+            wb.close()
+
+
 class FetchUrlHandler(APIHandler):
     @tornado.web.authenticated
     async def post(self):
@@ -1554,6 +1691,7 @@ def setup_route_handlers(web_app):
     bedrock_models_pattern = url_path_join(base_url, 'jupyter-mynerva', 'bedrock-models')
     fetch_url_pattern = url_path_join(base_url, 'jupyter-mynerva', 'fetch-url')
     read_pdf_pattern = url_path_join(base_url, 'jupyter-mynerva', 'read-pdf')
+    read_excel_pattern = url_path_join(base_url, 'jupyter-mynerva', 'read-excel')
     sessions_pattern = url_path_join(base_url, 'jupyter-mynerva', 'sessions')
     session_pattern = url_path_join(base_url, 'jupyter-mynerva', 'sessions', '([^/]+)')
     nblibram_pattern = url_path_join(base_url, 'jupyter-mynerva', 'nblibram')
@@ -1568,6 +1706,7 @@ def setup_route_handlers(web_app):
         (bedrock_models_pattern, BedrockModelsHandler),
         (fetch_url_pattern, FetchUrlHandler),
         (read_pdf_pattern, ReadPdfHandler),
+        (read_excel_pattern, ReadExcelHandler),
         (sessions_pattern, SessionsHandler),
         (session_pattern, SessionHandler),
         (nblibram_pattern, NblibramHandler),
