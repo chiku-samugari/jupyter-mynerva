@@ -39,16 +39,20 @@ class EventStreamParser:
         """
         self._buffer.extend(chunk)
         frames = []
-        while len(self._buffer) >= 12:
-            total_length = int.from_bytes(self._buffer[0:4], 'big')
-            headers_length = int.from_bytes(self._buffer[4:8], 'big')
-            if len(self._buffer) < total_length:
+        pos = 0
+        buf_len = len(self._buffer)
+        while buf_len - pos >= 12:
+            total_length = int.from_bytes(self._buffer[pos:pos + 4], 'big')
+            headers_length = int.from_bytes(self._buffer[pos + 4:pos + 8], 'big')
+            if buf_len - pos < total_length:
                 break
-            frame = bytes(self._buffer[:total_length])
-            del self._buffer[:total_length]
+            frame = bytes(self._buffer[pos:pos + total_length])
+            pos += total_length
             headers = self._parse_headers(frame[12:12 + headers_length])
             payload = frame[12 + headers_length:total_length - 4]
             frames.append((headers, payload))
+        if pos:
+            del self._buffer[:pos]
         return frames
 
     @staticmethod
