@@ -82,7 +82,7 @@ before-build-npm = [
 before-build-python = ["jlpm clean:all"]
 
 [project.optional-dependencies]
-pdf = ["pymupdf>=1.24.0"]
+pdf = ["pdfplumber>=0.10.0"]
 test = ["pytest>=7.0", "pytest-asyncio>=0.21"]
 
 [tool.pytest.ini_options]
