@@ -27,8 +27,11 @@ from jupyter_mynerva.routes import (
     ProviderModelsHandler,
     BedrockModelsHandler,
     FetchUrlHandler,
+    ReadPdfHandler,
     fetch_url_safely,
     _validate_fetch_url,
+    _parse_page_range,
+    _READ_PDF_MAX_PAGES,
     _NotebookStore,
     _convert_messages_for_responses_api,
     _build_anthropic_params,
@@ -2260,4 +2263,247 @@ async def test_fetch_url_handler_transport_error_returns_502(monkeypatch):
     handler.set_status.assert_called_once_with(502)
     body = json.loads(handler.finish.call_args[0][0])
     assert 'host unreachable' in body['error']
+
+
+# --- _parse_page_range ---
+
+def test_parse_page_range_single_page():
+    assert _parse_page_range('3', 10) == [2]
+
+
+def test_parse_page_range_range():
+    assert _parse_page_range('1-5', 10) == [0, 1, 2, 3, 4]
+
+
+def test_parse_page_range_comma_separated():
+    assert _parse_page_range('1-3, 5', 10) == [0, 1, 2, 4]
+
+
+def test_parse_page_range_clamps_to_total():
+    assert _parse_page_range('1-5', 3) == [0, 1, 2]
+
+
+def test_parse_page_range_page_beyond_total_skipped():
+    assert _parse_page_range('100', 5) == []
+
+
+def test_parse_page_range_no_duplicates():
+    assert _parse_page_range('1-3, 2-4', 10) == [0, 1, 2, 3]
+
+
+def test_parse_page_range_invalid_range_raises():
+    with pytest.raises(ValueError, match='Invalid page range'):
+        _parse_page_range('5-3', 10)
+
+
+def test_parse_page_range_zero_page_raises():
+    with pytest.raises(ValueError, match='Invalid page number'):
+        _parse_page_range('0', 10)
+
+
+def test_parse_page_range_negative_start_raises():
+    with pytest.raises(ValueError):
+        _parse_page_range('-1-3', 10)
+
+
+# --- ReadPdfHandler ---
+
+def _make_read_pdf_handler(body, root_dir):
+    h = MagicMock()
+    h.current_user = 'user'
+    h.get_json_body.return_value = body
+    h.contents_manager.root_dir = root_dir
+    h._validate_path = lambda path: ReadPdfHandler._validate_path(h, path)
+    return h
+
+
+def _mock_pdf_pages(texts):
+    """Build a mock pdfplumber PDF object with pages returning given texts."""
+    pages = []
+    for text in texts:
+        page = MagicMock()
+        page.extract_text.return_value = text
+        pages.append(page)
+
+    pdf = MagicMock()
+    pdf.pages = pages
+    pdf.__enter__ = MagicMock(return_value=pdf)
+    pdf.__exit__ = MagicMock(return_value=False)
+    return pdf
+
+
+def test_read_pdf_handler_success(tmp_path, monkeypatch):
+    pdf_file = tmp_path / 'test.pdf'
+    pdf_file.write_bytes(b'%PDF-fake')
+
+    mock_pdf = _mock_pdf_pages(['Page 1 text', 'Page 2 text', 'Page 3 text'])
+    mock_pdfplumber = MagicMock()
+    mock_pdfplumber.open.return_value = mock_pdf
+    monkeypatch.setitem(__import__('sys').modules, 'pdfplumber', mock_pdfplumber)
+
+    handler = _make_read_pdf_handler({'path': 'test.pdf'}, str(tmp_path))
+
+    ReadPdfHandler.post(handler)
+
+    handler.set_status.assert_not_called()
+    body = json.loads(handler.finish.call_args[0][0])
+    assert body['path'] == 'test.pdf'
+    assert body['totalPages'] == 3
+    assert len(body['content']) == 3
+    assert body['content'][0] == {'page': 1, 'text': 'Page 1 text'}
+    assert body['content'][2] == {'page': 3, 'text': 'Page 3 text'}
+
+
+def test_read_pdf_handler_with_page_range(tmp_path, monkeypatch):
+    pdf_file = tmp_path / 'test.pdf'
+    pdf_file.write_bytes(b'%PDF-fake')
+
+    texts = [f'Page {i+1}' for i in range(10)]
+    mock_pdf = _mock_pdf_pages(texts)
+    mock_pdfplumber = MagicMock()
+    mock_pdfplumber.open.return_value = mock_pdf
+    monkeypatch.setitem(__import__('sys').modules, 'pdfplumber', mock_pdfplumber)
+
+    handler = _make_read_pdf_handler({'path': 'test.pdf', 'pages': '2-4'}, str(tmp_path))
+
+    ReadPdfHandler.post(handler)
+
+    body = json.loads(handler.finish.call_args[0][0])
+    assert body['pages'] == '2-4'
+    assert len(body['content']) == 3
+    assert body['content'][0] == {'page': 2, 'text': 'Page 2'}
+    assert body['content'][2] == {'page': 4, 'text': 'Page 4'}
+
+
+def test_read_pdf_handler_caps_at_max_pages(tmp_path, monkeypatch):
+    pdf_file = tmp_path / 'test.pdf'
+    pdf_file.write_bytes(b'%PDF-fake')
+
+    texts = [f'Page {i+1}' for i in range(60)]
+    mock_pdf = _mock_pdf_pages(texts)
+    mock_pdfplumber = MagicMock()
+    mock_pdfplumber.open.return_value = mock_pdf
+    monkeypatch.setitem(__import__('sys').modules, 'pdfplumber', mock_pdfplumber)
+
+    handler = _make_read_pdf_handler({'path': 'test.pdf'}, str(tmp_path))
+
+    ReadPdfHandler.post(handler)
+
+    body = json.loads(handler.finish.call_args[0][0])
+    assert body['totalPages'] == 60
+    assert len(body['content']) == _READ_PDF_MAX_PAGES
+    assert f'capped at {_READ_PDF_MAX_PAGES} of 60' in body['pages']
+
+
+def test_read_pdf_handler_missing_path(tmp_path):
+    handler = _make_read_pdf_handler({}, str(tmp_path))
+
+    with patch.dict('sys.modules', {'pdfplumber': MagicMock()}):
+        ReadPdfHandler.post(handler)
+
+    handler.set_status.assert_called_once_with(400)
+    body = json.loads(handler.finish.call_args[0][0])
+    assert 'path is required' in body['error']
+
+
+def test_read_pdf_handler_file_not_found(tmp_path):
+    handler = _make_read_pdf_handler({'path': 'nonexistent.pdf'}, str(tmp_path))
+
+    with patch.dict('sys.modules', {'pdfplumber': MagicMock()}):
+        ReadPdfHandler.post(handler)
+
+    handler.set_status.assert_called_once_with(404)
+    body = json.loads(handler.finish.call_args[0][0])
+    assert 'File not found' in body['error']
+
+
+def test_read_pdf_handler_path_traversal(tmp_path):
+    handler = _make_read_pdf_handler({'path': '../../etc/passwd'}, str(tmp_path))
+
+    with patch.dict('sys.modules', {'pdfplumber': MagicMock()}):
+        ReadPdfHandler.post(handler)
+
+    handler.set_status.assert_called_once_with(400)
+    body = json.loads(handler.finish.call_args[0][0])
+    assert 'escapes content root' in body['error']
+
+
+def test_read_pdf_handler_hidden_file(tmp_path):
+    hidden_dir = tmp_path / '.secret'
+    hidden_dir.mkdir()
+    pdf_file = hidden_dir / 'test.pdf'
+    pdf_file.write_bytes(b'%PDF-fake')
+
+    handler = _make_read_pdf_handler({'path': '.secret/test.pdf'}, str(tmp_path))
+
+    with patch.dict('sys.modules', {'pdfplumber': MagicMock()}):
+        ReadPdfHandler.post(handler)
+
+    handler.set_status.assert_called_once_with(400)
+    body = json.loads(handler.finish.call_args[0][0])
+    assert 'hidden files' in body['error']
+
+
+def test_read_pdf_handler_invalid_page_range(tmp_path, monkeypatch):
+    pdf_file = tmp_path / 'test.pdf'
+    pdf_file.write_bytes(b'%PDF-fake')
+
+    mock_pdf = _mock_pdf_pages(['Page 1'])
+    mock_pdfplumber = MagicMock()
+    mock_pdfplumber.open.return_value = mock_pdf
+    monkeypatch.setitem(__import__('sys').modules, 'pdfplumber', mock_pdfplumber)
+
+    handler = _make_read_pdf_handler({'path': 'test.pdf', 'pages': '5-3'}, str(tmp_path))
+
+    ReadPdfHandler.post(handler)
+
+    handler.set_status.assert_called_once_with(400)
+    body = json.loads(handler.finish.call_args[0][0])
+    assert 'Invalid page range' in body['error']
+
+
+def test_read_pdf_handler_pdfplumber_not_installed(monkeypatch):
+    monkeypatch.setitem(__import__('sys').modules, 'pdfplumber', None)
+
+    handler = _make_read_pdf_handler({'path': 'test.pdf'}, '/tmp')
+
+    ReadPdfHandler.post(handler)
+
+    handler.set_status.assert_called_once_with(500)
+    body = json.loads(handler.finish.call_args[0][0])
+    assert 'pdfplumber is not installed' in body['error']
+
+
+def test_read_pdf_handler_open_failure(tmp_path, monkeypatch):
+    pdf_file = tmp_path / 'corrupt.pdf'
+    pdf_file.write_bytes(b'not-a-pdf')
+
+    mock_pdfplumber = MagicMock()
+    mock_pdfplumber.open.side_effect = Exception('Cannot read PDF')
+    monkeypatch.setitem(__import__('sys').modules, 'pdfplumber', mock_pdfplumber)
+
+    handler = _make_read_pdf_handler({'path': 'corrupt.pdf'}, str(tmp_path))
+
+    ReadPdfHandler.post(handler)
+
+    handler.set_status.assert_called_once_with(400)
+    body = json.loads(handler.finish.call_args[0][0])
+    assert 'Failed to open PDF' in body['error']
+
+
+def test_read_pdf_handler_empty_text_page(tmp_path, monkeypatch):
+    pdf_file = tmp_path / 'empty.pdf'
+    pdf_file.write_bytes(b'%PDF-fake')
+
+    mock_pdf = _mock_pdf_pages([None])
+    mock_pdfplumber = MagicMock()
+    mock_pdfplumber.open.return_value = mock_pdf
+    monkeypatch.setitem(__import__('sys').modules, 'pdfplumber', mock_pdfplumber)
+
+    handler = _make_read_pdf_handler({'path': 'empty.pdf'}, str(tmp_path))
+
+    ReadPdfHandler.post(handler)
+
+    body = json.loads(handler.finish.call_args[0][0])
+    assert body['content'][0] == {'page': 1, 'text': ''}
 
