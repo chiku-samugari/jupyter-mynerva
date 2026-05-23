@@ -78,6 +78,16 @@ const ACTION_DETAILS: Record<string, IActionDetail> = {
     optional: [],
     usesQuery: false
   },
+  readPdf: {
+    description:
+      'Read text content from a PDF file. Returns extracted text per page. ' +
+      'Use "pages" to read specific pages (e.g. "1-5", "3", "10-20"). ' +
+      'Omit "pages" to read all pages (capped at 50 pages). ' +
+      'The user approves each file path; "Share & Always" auto-approves the same path.',
+    required: ['path'],
+    optional: ['pages'],
+    usesQuery: false
+  },
   insertCell: {
     description: 'Insert new cell',
     required: ['position', 'cellType', 'source'],
@@ -169,6 +179,12 @@ Web fetch:
     The user approves each URL; "Share & Always" auto-approves the same origin.
     Content is sent verbatim (no privacy filter) because public URLs are public
     by definition.
+
+PDF reading:
+  - readPdf: { "path": "file.pdf", "pages": "1-5" } - Read text from a PDF file.
+    Returns { path, pages, content: [{ page, text }] }. "pages" is optional
+    (e.g. "1-5", "3", "10-20"); omit to read all pages (capped at 50).
+    The user approves each path; "Share & Always" auto-approves the same path.
 
 Mutate (active notebook):
   - insertCell: { "position": {...} or "end", "cellType": "code"|"markdown", "source": "..." } - Insert new cell

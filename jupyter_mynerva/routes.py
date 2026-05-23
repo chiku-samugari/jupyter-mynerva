@@ -1351,6 +1351,118 @@ async def fetch_url_safely(url):
         raise ValueError(f'Too many redirects (>{_FETCH_URL_MAX_REDIRECTS})')
 
 
+_READ_PDF_MAX_PAGES = 50
+
+
+def _parse_page_range(pages_str, total_pages):
+    """Parse a page range string like "1-5", "3", "10-20" into a list of 0-based indices."""
+    result = []
+    for part in pages_str.split(','):
+        part = part.strip()
+        if '-' in part:
+            start_s, end_s = part.split('-', 1)
+            start = int(start_s)
+            end = int(end_s)
+            if start < 1 or end < start:
+                raise ValueError(f'Invalid page range: {part}')
+            for p in range(start - 1, min(end, total_pages)):
+                if p not in result:
+                    result.append(p)
+        else:
+            p = int(part)
+            if p < 1:
+                raise ValueError(f'Invalid page number: {p}')
+            idx = p - 1
+            if idx < total_pages and idx not in result:
+                result.append(idx)
+    return result
+
+
+class ReadPdfHandler(APIHandler):
+
+    def _validate_path(self, path):
+        """Resolve path against content root. Rejects traversal and hidden files."""
+        root_dir = os.path.realpath(self.contents_manager.root_dir)
+        resolved = os.path.realpath(os.path.join(root_dir, path))
+        if not resolved.startswith(root_dir + os.sep):
+            raise ValueError('path escapes content root')
+        rel = os.path.relpath(resolved, root_dir)
+        for part in rel.split(os.sep):
+            if part.startswith('.'):
+                raise ValueError('hidden files are not accessible')
+        return resolved
+
+    @tornado.web.authenticated
+    def post(self):
+        try:
+            import pymupdf
+        except ImportError:
+            self.set_status(500)
+            self.finish(json.dumps({
+                'error': 'pymupdf is not installed. Run: pip install pymupdf'
+            }))
+            return
+
+        data = self.get_json_body()
+        path = data.get('path', '')
+        if not path:
+            self.set_status(400)
+            self.finish(json.dumps({'error': 'path is required'}))
+            return
+
+        try:
+            resolved = self._validate_path(path)
+        except ValueError as e:
+            self.set_status(400)
+            self.finish(json.dumps({'error': str(e)}))
+            return
+
+        if not os.path.isfile(resolved):
+            self.set_status(404)
+            self.finish(json.dumps({'error': f'File not found: {path}'}))
+            return
+
+        try:
+            doc = pymupdf.open(resolved)
+        except Exception as e:
+            self.set_status(400)
+            self.finish(json.dumps({'error': f'Failed to open PDF: {e}'}))
+            return
+
+        try:
+            total_pages = len(doc)
+            pages_str = data.get('pages', '')
+
+            if pages_str:
+                try:
+                    page_indices = _parse_page_range(pages_str, total_pages)
+                except ValueError as e:
+                    self.set_status(400)
+                    self.finish(json.dumps({'error': str(e)}))
+                    return
+            else:
+                page_indices = list(range(min(total_pages, _READ_PDF_MAX_PAGES)))
+
+            content = []
+            for idx in page_indices:
+                page = doc[idx]
+                text = page.get_text()
+                content.append({'page': idx + 1, 'text': text})
+
+            pages_desc = pages_str if pages_str else f'1-{len(page_indices)}'
+            if not pages_str and total_pages > _READ_PDF_MAX_PAGES:
+                pages_desc += f' (capped at {_READ_PDF_MAX_PAGES} of {total_pages})'
+
+            self.finish(json.dumps({
+                'path': path,
+                'totalPages': total_pages,
+                'pages': pages_desc,
+                'content': content,
+            }))
+        finally:
+            doc.close()
+
+
 class FetchUrlHandler(APIHandler):
     @tornado.web.authenticated
     async def post(self):
@@ -1388,6 +1500,7 @@ def setup_route_handlers(web_app):
     openai_models_pattern = url_path_join(base_url, 'jupyter-mynerva', 'openai-models')
     bedrock_models_pattern = url_path_join(base_url, 'jupyter-mynerva', 'bedrock-models')
     fetch_url_pattern = url_path_join(base_url, 'jupyter-mynerva', 'fetch-url')
+    read_pdf_pattern = url_path_join(base_url, 'jupyter-mynerva', 'read-pdf')
     sessions_pattern = url_path_join(base_url, 'jupyter-mynerva', 'sessions')
     session_pattern = url_path_join(base_url, 'jupyter-mynerva', 'sessions', '([^/]+)')
     nblibram_pattern = url_path_join(base_url, 'jupyter-mynerva', 'nblibram')
@@ -1400,6 +1513,7 @@ def setup_route_handlers(web_app):
         (openai_models_pattern, OpenAIModelsHandler),
         (bedrock_models_pattern, BedrockModelsHandler),
         (fetch_url_pattern, FetchUrlHandler),
+        (read_pdf_pattern, ReadPdfHandler),
         (sessions_pattern, SessionsHandler),
         (session_pattern, SessionHandler),
         (nblibram_pattern, NblibramHandler),

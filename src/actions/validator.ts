@@ -48,6 +48,11 @@ const ACTION_SCHEMAS: Record<
     required: ['url'],
     optional: []
   },
+  // PDF reading
+  readPdf: {
+    required: ['path'],
+    optional: ['pages']
+  },
   // Mutate actions
   insertCell: {
     required: ['position', 'cellType', 'source'],
