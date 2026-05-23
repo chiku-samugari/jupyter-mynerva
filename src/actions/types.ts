@@ -22,6 +22,7 @@ export type IQueryAction =
   | IGetCellsFromFileAction
   | IGetOutputFromFileAction
   | IFetchUrlAction
+  | IReadPdfAction
   | IListHelpAction
   | IHelpDetailAction;
 
@@ -91,6 +92,12 @@ export interface IGetOutputFromFileAction {
 export interface IFetchUrlAction {
   type: 'fetchUrl';
   url: string;
+}
+
+export interface IReadPdfAction {
+  type: 'readPdf';
+  path: string;
+  pages?: string;
 }
 
 export interface IListHelpAction {

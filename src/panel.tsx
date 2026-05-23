@@ -209,6 +209,38 @@ async function fetchUrl(targetUrl: string): Promise<IFetchUrlResult> {
   return response.json();
 }
 
+interface IReadPdfResult {
+  path: string;
+  pages: string;
+  content: Array<{ page: number; text: string }>;
+}
+
+async function readPdf(
+  path: string,
+  pages?: string
+): Promise<IReadPdfResult> {
+  const settings = ServerConnection.makeSettings();
+  const url = `${settings.baseUrl}jupyter-mynerva/read-pdf`;
+  const body: Record<string, string> = { path };
+  if (pages) {
+    body.pages = pages;
+  }
+  const response = await ServerConnection.makeRequest(
+    url,
+    {
+      method: 'POST',
+      body: JSON.stringify(body)
+    },
+    settings
+  );
+
+  if (!response.ok) {
+    const data = await response.json();
+    throw new Error(data.error || `Read PDF failed (${response.status})`);
+  }
+  return response.json();
+}
+
 interface IStreamCallbacks {
   onContentBlockStart: (
     contentType: string,
@@ -868,6 +900,7 @@ const QUERY_ACTION_TYPES = [
   'getCellsFromFile',
   'getOutputFromFile',
   'fetchUrl',
+  'readPdf',
   'listHelp',
   'help'
 ];
@@ -1491,6 +1524,27 @@ function MynervaComponent({
         }
         break;
       }
+      case 'readPdf': {
+        try {
+          const pdfResult = await readPdf(action.path, action.pages);
+          result = JSON.stringify(
+            { type: 'readPdf', result: pdfResult },
+            null,
+            2
+          );
+        } catch (e) {
+          result = JSON.stringify(
+            {
+              type: 'readPdf',
+              path: action.path,
+              error: e instanceof Error ? e.message : String(e)
+            },
+            null,
+            2
+          );
+        }
+        break;
+      }
       default:
         result = JSON.stringify(
           { type: 'unknown', error: 'Unknown action type' },
@@ -1607,7 +1661,8 @@ function MynervaComponent({
     'getTocFromFile',
     'getSectionFromFile',
     'getCellsFromFile',
-    'getOutputFromFile'
+    'getOutputFromFile',
+    'readPdf'
   ];
 
   const isFileQueryAction = (action: IAction): boolean => {
