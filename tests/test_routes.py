@@ -27,10 +27,13 @@ from jupyter_mynerva.routes import (
     BedrockModelsHandler,
     FetchUrlHandler,
     ReadPdfHandler,
+    ReadExcelHandler,
     fetch_url_safely,
     _validate_fetch_url,
     _parse_page_range,
+    _parse_row_range,
     _READ_PDF_MAX_PAGES,
+    _READ_EXCEL_MAX_ROWS,
     _NotebookStore,
     _convert_messages_for_responses_api,
     _build_anthropic_params,
@@ -2356,4 +2359,274 @@ def test_read_pdf_handler_empty_text_page(tmp_path, monkeypatch):
 
     body = json.loads(handler.finish.call_args[0][0])
     assert body['content'][0] == {'page': 1, 'text': ''}
+
+
+# --- _parse_row_range ---
+
+def test_parse_row_range_single_row():
+    assert _parse_row_range('3', 10) == [2]
+
+
+def test_parse_row_range_range():
+    assert _parse_row_range('1-5', 10) == [0, 1, 2, 3, 4]
+
+
+def test_parse_row_range_comma_separated():
+    assert _parse_row_range('1-3, 5', 10) == [0, 1, 2, 4]
+
+
+def test_parse_row_range_clamps_to_total():
+    assert _parse_row_range('1-5', 3) == [0, 1, 2]
+
+
+def test_parse_row_range_row_beyond_total_skipped():
+    assert _parse_row_range('100', 5) == []
+
+
+def test_parse_row_range_no_duplicates():
+    assert _parse_row_range('1-3, 2-4', 10) == [0, 1, 2, 3]
+
+
+def test_parse_row_range_invalid_range_raises():
+    with pytest.raises(ValueError):
+        _parse_row_range('5-3', 10)
+
+
+def test_parse_row_range_zero_row_raises():
+    with pytest.raises(ValueError):
+        _parse_row_range('0', 10)
+
+
+# --- ReadExcelHandler ---
+
+def _make_read_excel_handler(body, root_dir):
+    h = MagicMock()
+    h.current_user = 'user'
+    h.get_json_body.return_value = body
+    h.contents_manager.root_dir = root_dir
+    h._validate_path = lambda path: ReadExcelHandler._validate_path(h, path)
+    return h
+
+
+def _mock_excel_workbook(sheets):
+    """Build a mock openpyxl workbook. sheets is a dict of {name: [[row1], [row2], ...]}."""
+    wb = MagicMock()
+    wb.sheetnames = list(sheets.keys())
+
+    mock_sheets = {}
+    first_sheet = None
+    for name, rows in sheets.items():
+        ws = MagicMock()
+        ws.title = name
+        ws.iter_rows = MagicMock(return_value=(tuple(r) for r in rows))
+        mock_sheets[name] = ws
+        if first_sheet is None:
+            first_sheet = ws
+
+    wb.active = first_sheet
+    wb.__getitem__ = lambda self, key: mock_sheets[key]
+    wb.close = MagicMock()
+    return wb
+
+
+def test_read_excel_handler_success(tmp_path, monkeypatch):
+    excel_file = tmp_path / 'test.xlsx'
+    excel_file.write_bytes(b'fake-xlsx')
+
+    sheets = {'Sheet1': [['Name', 'Age'], ['Alice', 30], ['Bob', 25]]}
+    mock_wb = _mock_excel_workbook(sheets)
+    mock_openpyxl = MagicMock()
+    mock_openpyxl.load_workbook.return_value = mock_wb
+    monkeypatch.setitem(__import__('sys').modules, 'openpyxl', mock_openpyxl)
+
+    handler = _make_read_excel_handler({'path': 'test.xlsx'}, str(tmp_path))
+
+    ReadExcelHandler.post(handler)
+
+    handler.set_status.assert_not_called()
+    body = json.loads(handler.finish.call_args[0][0])
+    assert body['path'] == 'test.xlsx'
+    assert body['sheet'] == 'Sheet1'
+    assert body['totalRows'] == 3
+    assert body['headers'] == ['Name', 'Age']
+    assert len(body['data']) == 3
+
+
+def test_read_excel_handler_specific_sheet(tmp_path, monkeypatch):
+    excel_file = tmp_path / 'test.xlsx'
+    excel_file.write_bytes(b'fake-xlsx')
+
+    sheets = {
+        'Sheet1': [['A', 'B']],
+        'Data': [['X', 'Y'], [1, 2], [3, 4]]
+    }
+    mock_wb = _mock_excel_workbook(sheets)
+    mock_openpyxl = MagicMock()
+    mock_openpyxl.load_workbook.return_value = mock_wb
+    monkeypatch.setitem(__import__('sys').modules, 'openpyxl', mock_openpyxl)
+
+    handler = _make_read_excel_handler({'path': 'test.xlsx', 'sheet': 'Data'}, str(tmp_path))
+
+    ReadExcelHandler.post(handler)
+
+    body = json.loads(handler.finish.call_args[0][0])
+    assert body['sheet'] == 'Data'
+    assert body['totalRows'] == 3
+
+
+def test_read_excel_handler_sheet_not_found(tmp_path, monkeypatch):
+    excel_file = tmp_path / 'test.xlsx'
+    excel_file.write_bytes(b'fake-xlsx')
+
+    sheets = {'Sheet1': [['A']]}
+    mock_wb = _mock_excel_workbook(sheets)
+    mock_openpyxl = MagicMock()
+    mock_openpyxl.load_workbook.return_value = mock_wb
+    monkeypatch.setitem(__import__('sys').modules, 'openpyxl', mock_openpyxl)
+
+    handler = _make_read_excel_handler({'path': 'test.xlsx', 'sheet': 'NoSuch'}, str(tmp_path))
+
+    ReadExcelHandler.post(handler)
+
+    handler.set_status.assert_called_once_with(400)
+    body = json.loads(handler.finish.call_args[0][0])
+    assert 'Sheet not found' in body['error']
+
+
+def test_read_excel_handler_with_row_range(tmp_path, monkeypatch):
+    excel_file = tmp_path / 'test.xlsx'
+    excel_file.write_bytes(b'fake-xlsx')
+
+    rows = [['H1', 'H2']] + [[f'r{i}c1', f'r{i}c2'] for i in range(1, 11)]
+    sheets = {'Sheet1': rows}
+    mock_wb = _mock_excel_workbook(sheets)
+    mock_openpyxl = MagicMock()
+    mock_openpyxl.load_workbook.return_value = mock_wb
+    monkeypatch.setitem(__import__('sys').modules, 'openpyxl', mock_openpyxl)
+
+    handler = _make_read_excel_handler({'path': 'test.xlsx', 'rows': '2-4'}, str(tmp_path))
+
+    ReadExcelHandler.post(handler)
+
+    body = json.loads(handler.finish.call_args[0][0])
+    assert body['rows'] == '2-4'
+    assert len(body['data']) == 3
+
+
+def test_read_excel_handler_missing_path(tmp_path):
+    handler = _make_read_excel_handler({}, str(tmp_path))
+
+    with patch.dict('sys.modules', {'openpyxl': MagicMock()}):
+        ReadExcelHandler.post(handler)
+
+    handler.set_status.assert_called_once_with(400)
+    body = json.loads(handler.finish.call_args[0][0])
+    assert 'path is required' in body['error']
+
+
+def test_read_excel_handler_file_not_found(tmp_path):
+    handler = _make_read_excel_handler({'path': 'nonexistent.xlsx'}, str(tmp_path))
+
+    with patch.dict('sys.modules', {'openpyxl': MagicMock()}):
+        ReadExcelHandler.post(handler)
+
+    handler.set_status.assert_called_once_with(404)
+    body = json.loads(handler.finish.call_args[0][0])
+    assert 'File not found' in body['error']
+
+
+def test_read_excel_handler_path_traversal(tmp_path):
+    handler = _make_read_excel_handler({'path': '../../etc/passwd'}, str(tmp_path))
+
+    with patch.dict('sys.modules', {'openpyxl': MagicMock()}):
+        ReadExcelHandler.post(handler)
+
+    handler.set_status.assert_called_once_with(400)
+    body = json.loads(handler.finish.call_args[0][0])
+    assert 'escapes content root' in body['error']
+
+
+def test_read_excel_handler_hidden_file(tmp_path):
+    hidden_dir = tmp_path / '.secret'
+    hidden_dir.mkdir()
+    excel_file = hidden_dir / 'test.xlsx'
+    excel_file.write_bytes(b'fake-xlsx')
+
+    handler = _make_read_excel_handler({'path': '.secret/test.xlsx'}, str(tmp_path))
+
+    with patch.dict('sys.modules', {'openpyxl': MagicMock()}):
+        ReadExcelHandler.post(handler)
+
+    handler.set_status.assert_called_once_with(400)
+    body = json.loads(handler.finish.call_args[0][0])
+    assert 'hidden files' in body['error']
+
+
+def test_read_excel_handler_openpyxl_not_installed(monkeypatch):
+    monkeypatch.setitem(__import__('sys').modules, 'openpyxl', None)
+
+    handler = _make_read_excel_handler({'path': 'test.xlsx'}, '/tmp')
+
+    ReadExcelHandler.post(handler)
+
+    handler.set_status.assert_called_once_with(500)
+    body = json.loads(handler.finish.call_args[0][0])
+    assert 'openpyxl is not installed' in body['error']
+
+
+def test_read_excel_handler_open_failure(tmp_path, monkeypatch):
+    excel_file = tmp_path / 'corrupt.xlsx'
+    excel_file.write_bytes(b'not-an-excel')
+
+    mock_openpyxl = MagicMock()
+    mock_openpyxl.load_workbook.side_effect = Exception('Cannot read file')
+    monkeypatch.setitem(__import__('sys').modules, 'openpyxl', mock_openpyxl)
+
+    handler = _make_read_excel_handler({'path': 'corrupt.xlsx'}, str(tmp_path))
+
+    ReadExcelHandler.post(handler)
+
+    handler.set_status.assert_called_once_with(400)
+    body = json.loads(handler.finish.call_args[0][0])
+    assert 'Failed to open Excel file' in body['error']
+
+
+def test_read_excel_handler_invalid_row_range(tmp_path, monkeypatch):
+    excel_file = tmp_path / 'test.xlsx'
+    excel_file.write_bytes(b'fake-xlsx')
+
+    sheets = {'Sheet1': [['A'], ['1']]}
+    mock_wb = _mock_excel_workbook(sheets)
+    mock_openpyxl = MagicMock()
+    mock_openpyxl.load_workbook.return_value = mock_wb
+    monkeypatch.setitem(__import__('sys').modules, 'openpyxl', mock_openpyxl)
+
+    handler = _make_read_excel_handler({'path': 'test.xlsx', 'rows': '5-3'}, str(tmp_path))
+
+    ReadExcelHandler.post(handler)
+
+    handler.set_status.assert_called_once_with(400)
+    body = json.loads(handler.finish.call_args[0][0])
+    assert 'Invalid row range' in body['error']
+
+
+def test_read_excel_handler_caps_at_max_rows(tmp_path, monkeypatch):
+    excel_file = tmp_path / 'test.xlsx'
+    excel_file.write_bytes(b'fake-xlsx')
+
+    rows = [['H1']] + [[f'val{i}'] for i in range(1500)]
+    sheets = {'Sheet1': rows}
+    mock_wb = _mock_excel_workbook(sheets)
+    mock_openpyxl = MagicMock()
+    mock_openpyxl.load_workbook.return_value = mock_wb
+    monkeypatch.setitem(__import__('sys').modules, 'openpyxl', mock_openpyxl)
+
+    handler = _make_read_excel_handler({'path': 'test.xlsx'}, str(tmp_path))
+
+    ReadExcelHandler.post(handler)
+
+    body = json.loads(handler.finish.call_args[0][0])
+    assert body['totalRows'] == 1501
+    assert len(body['data']) == _READ_EXCEL_MAX_ROWS
+    assert f'capped at {_READ_EXCEL_MAX_ROWS} of 1501' in body['rows']
 

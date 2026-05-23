@@ -34,6 +34,8 @@ function getActionLabel(action: IQueryAction): string {
       return `Fetch URL: ${action.url}`;
     case 'readPdf':
       return `Read PDF: ${action.path}${action.pages ? ` (pages: ${action.pages})` : ''}`;
+    case 'readExcel':
+      return `Read Excel: ${action.path}${action.sheet ? ` (sheet: ${action.sheet})` : ''}${action.rows ? ` (rows: ${action.rows})` : ''}`;
     case 'listHelp':
       return 'Show available actions';
     case 'help':

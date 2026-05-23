@@ -23,6 +23,7 @@ export type IQueryAction =
   | IGetOutputFromFileAction
   | IFetchUrlAction
   | IReadPdfAction
+  | IReadExcelAction
   | IListHelpAction
   | IHelpDetailAction;
 
@@ -98,6 +99,13 @@ export interface IReadPdfAction {
   type: 'readPdf';
   path: string;
   pages?: string;
+}
+
+export interface IReadExcelAction {
+  type: 'readExcel';
+  path: string;
+  sheet?: string;
+  rows?: string;
 }
 
 export interface IListHelpAction {

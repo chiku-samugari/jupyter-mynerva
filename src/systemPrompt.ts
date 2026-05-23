@@ -88,6 +88,16 @@ const ACTION_DETAILS: Record<string, IActionDetail> = {
     optional: ['pages'],
     usesQuery: false
   },
+  readExcel: {
+    description:
+      'Read data from an Excel file (.xlsx, .xls). Returns cell data as rows per sheet. ' +
+      'Use "sheet" to read a specific sheet by name; omit to read the first sheet. ' +
+      'Use "rows" to read specific rows (e.g. "1-100", "5-20"); omit to read all rows (capped at 1000). ' +
+      'The user approves each file path; "Share & Always" auto-approves the same path.',
+    required: ['path'],
+    optional: ['sheet', 'rows'],
+    usesQuery: false
+  },
   insertCell: {
     description: 'Insert new cell',
     required: ['position', 'cellType', 'source'],
@@ -184,6 +194,12 @@ PDF reading:
   - readPdf: { "path": "file.pdf", "pages": "1-5" } - Read text from a PDF file.
     Returns { path, pages, content: [{ page, text }] }. "pages" is optional
     (e.g. "1-5", "3", "10-20"); omit to read all pages (capped at 50).
+    The user approves each path; "Share & Always" auto-approves the same path.
+
+Excel reading:
+  - readExcel: { "path": "file.xlsx", "sheet": "Sheet1", "rows": "1-100" } - Read data from an Excel file.
+    Returns { path, sheet, totalRows, rows, headers, data: [[...], ...] }. "sheet" is optional
+    (defaults to first sheet). "rows" is optional (e.g. "1-100", "5-20"); omit to read all rows (capped at 1000).
     The user approves each path; "Share & Always" auto-approves the same path.
 
 Mutate (active notebook):
