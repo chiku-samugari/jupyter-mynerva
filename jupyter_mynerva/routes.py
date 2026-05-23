@@ -1395,11 +1395,11 @@ class ReadPdfHandler(APIHandler):
     @tornado.web.authenticated
     def post(self):
         try:
-            import pymupdf
+            import pdfplumber
         except ImportError:
             self.set_status(500)
             self.finish(json.dumps({
-                'error': 'pymupdf is not installed. Run: pip install pymupdf'
+                'error': 'pdfplumber is not installed. Run: pip install pdfplumber'
             }))
             return
 
@@ -1423,14 +1423,14 @@ class ReadPdfHandler(APIHandler):
             return
 
         try:
-            doc = pymupdf.open(resolved)
+            pdf = pdfplumber.open(resolved)
         except Exception as e:
             self.set_status(400)
             self.finish(json.dumps({'error': f'Failed to open PDF: {e}'}))
             return
 
-        try:
-            total_pages = len(doc)
+        with pdf:
+            total_pages = len(pdf.pages)
             pages_str = data.get('pages', '')
 
             if pages_str:
@@ -1445,8 +1445,8 @@ class ReadPdfHandler(APIHandler):
 
             content = []
             for idx in page_indices:
-                page = doc[idx]
-                text = page.get_text()
+                page = pdf.pages[idx]
+                text = page.extract_text() or ''
                 content.append({'page': idx + 1, 'text': text})
 
             pages_desc = pages_str if pages_str else f'1-{len(page_indices)}'
@@ -1459,8 +1459,6 @@ class ReadPdfHandler(APIHandler):
                 'pages': pages_desc,
                 'content': content,
             }))
-        finally:
-            doc.close()
 
 
 class FetchUrlHandler(APIHandler):
