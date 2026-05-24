@@ -267,7 +267,7 @@ To use it:
 1. Select "Amazon Bedrock (Converse)" in Settings
 2. Choose the AWS region (default `us-east-1`)
 3. Paste your Bedrock API key
-4. Click the refresh icon next to the model dropdown — the list is populated from Bedrock's `/inference-profiles` API, filtered by the bedrock entry in `jupyter_mynerva/models.json`
+4. Click the refresh icon next to the model dropdown. The list is populated from Bedrock's `/inference-profiles` API, filtered by the bedrock entry in `jupyter_mynerva/models.json`
 
 Extended thinking (reasoning) is enabled automatically for Anthropic-family model IDs (those whose ID contains `claude` or `anthropic`), giving the same UX as the dedicated Anthropic provider. Non-Anthropic Bedrock models are accepted by the chat path but added thinking config is skipped, since those models reject it.
 

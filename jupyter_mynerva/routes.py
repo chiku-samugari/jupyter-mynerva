@@ -324,6 +324,7 @@ def get_default_config():
     if not candidates:
         return None
 
+    # Determine provider
     explicit_provider = _DEFAULT_CONFIG.get('provider')
     if len(candidates) == 1:
         provider = candidates[0]
@@ -332,6 +333,7 @@ def get_default_config():
             return None
         provider = explicit_provider
 
+    # Determine model
     model = _DEFAULT_CONFIG.get('model')
     if not model:
         models = _get_provider_models(provider)
