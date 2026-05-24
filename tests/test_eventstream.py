@@ -122,3 +122,10 @@ def test_byte_at_a_time_feed():
         out.extend(parser.feed(bytes([byte])))
     assert len(out) == 1
     assert out[0][0][':event-type'] == 'messageStop'
+
+
+def test_zero_total_length_does_not_loop():
+    """A malformed frame with total_length=0 must not cause an infinite loop."""
+    parser = EventStreamParser()
+    bad = b'\x00\x00\x00\x00' + b'\x00' * 8  # 12 bytes, total_length=0
+    assert parser.feed(bad) == []

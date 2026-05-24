@@ -41,6 +41,8 @@ class EventStreamParser:
         frames = []
         while len(self._buffer) >= 12:
             total_length = int.from_bytes(self._buffer[0:4], 'big')
+            if total_length < 12:
+                break
             headers_length = int.from_bytes(self._buffer[4:8], 'big')
             if len(self._buffer) < total_length:
                 break
