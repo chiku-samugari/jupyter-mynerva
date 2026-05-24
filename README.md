@@ -235,16 +235,16 @@ Fernet key for encrypting API keys. If absent, Settings UI shows warning; keys s
 
 Administrators can provide default LLM settings via environment variables. Users can choose to use these defaults or configure their own.
 
-| Variable                    | Description                                                          |
-| --------------------------- | -------------------------------------------------------------------- |
-| `MYNERVA_OPENAI_API_KEY`    | Default OpenAI API key                                               |
-| `MYNERVA_OPENAI_BASE_URL`   | Default OpenAI-compatible endpoint (e.g. vLLM, Ollama)               |
-| `MYNERVA_ANTHROPIC_API_KEY` | Default Anthropic API key                                            |
-| `MYNERVA_BEDROCK_API_KEY`   | Default Amazon Bedrock short-term or long-term API key (bearer)      |
-| `MYNERVA_BEDROCK_REGION`    | AWS region for Bedrock requests                                      |
-| `MYNERVA_DEFAULT_PROVIDER`  | Default provider (`openai`, `anthropic`, or `bedrock`)               |
-| `MYNERVA_DEFAULT_MODEL`     | Default model name (optional, fetched from endpoint if not set)      |
-| `MYNERVA_DEFAULTS_ONLY`     | Lock LLM settings to admin defaults (hides settings UI)              |
+| Variable                    | Description                                                     |
+| --------------------------- | --------------------------------------------------------------- |
+| `MYNERVA_OPENAI_API_KEY`    | Default OpenAI API key                                          |
+| `MYNERVA_OPENAI_BASE_URL`   | Default OpenAI-compatible endpoint (e.g. vLLM, Ollama)          |
+| `MYNERVA_ANTHROPIC_API_KEY` | Default Anthropic API key                                       |
+| `MYNERVA_BEDROCK_API_KEY`   | Default Amazon Bedrock short-term or long-term API key (bearer) |
+| `MYNERVA_BEDROCK_REGION`    | AWS region for Bedrock requests                                 |
+| `MYNERVA_DEFAULT_PROVIDER`  | Default provider (`openai`, `anthropic`, or `bedrock`)          |
+| `MYNERVA_DEFAULT_MODEL`     | Default model name (optional, fetched from endpoint if not set) |
+| `MYNERVA_DEFAULTS_ONLY`     | Lock LLM settings to admin defaults (hides settings UI)         |
 
 **Provider auto-detection:**
 
