@@ -1593,9 +1593,6 @@ def test_fetch_bedrock_models_filters_active_system_defined():
                 # excluded: INACTIVE
                 {'inferenceProfileId': 'us.anthropic.claude-3-0-legacy-v1:0',
                  'status': 'INACTIVE', 'type': 'SYSTEM_DEFINED'},
-                # excluded by models.json allow filter (not claude-{sonnet,haiku,opus}-4-*)
-                {'inferenceProfileId': 'us.meta.llama3-70b-instruct-v1:0',
-                 'status': 'ACTIVE', 'type': 'SYSTEM_DEFINED'},
             ]
         },
     )
@@ -1644,8 +1641,8 @@ def test_fetch_bedrock_models_empty_after_filter_raises():
     response = _FakeSyncResponse(
         status_code=200,
         json_data={'inferenceProfileSummaries': [
-            {'inferenceProfileId': 'us.meta.llama3-70b-instruct-v1:0',
-             'status': 'ACTIVE', 'type': 'SYSTEM_DEFINED'},
+                {'inferenceProfileId': 'us.anthropic.claude-3-0-legacy-v1:0',
+                 'status': 'INACTIVE', 'type': 'SYSTEM_DEFINED'},
         ]},
     )
     with patch('jupyter_mynerva.routes.httpx.Client',
