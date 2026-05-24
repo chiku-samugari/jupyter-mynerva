@@ -238,6 +238,13 @@ def _get_provider_models(provider_id):
 _openai_models_cache = cachetools.TTLCache(maxsize=8, ttl=300)
 _bedrock_models_cache = cachetools.TTLCache(maxsize=8, ttl=300)
 
+_BEDROCK_REGION_RE = re.compile(r'^[a-z]{2}(-[a-z]+-\d+)?$')
+
+
+def _validate_bedrock_region(region):
+    if not _BEDROCK_REGION_RE.match(region):
+        raise ValueError(f'Invalid AWS region: {region}')
+
 
 def _fetch_bedrock_models(api_key, region):
     """Fetch active inference profile IDs from Bedrock management API.
@@ -254,6 +261,7 @@ def _fetch_bedrock_models(api_key, region):
     matching profiles in the region are returned; access failures surface
     later at Converse invocation time.
     """
+    _validate_bedrock_region(region)
     cache_key = (region, api_key or '')
     if cache_key in _bedrock_models_cache:
         return _bedrock_models_cache[cache_key]
@@ -784,6 +792,7 @@ async def chat_bedrock_converse(handler, api_key, region, model, messages):
     Short-term and long-term Bedrock API keys work directly as Bearer
     tokens, so no AWS SigV4 or boto3 is needed.
     """
+    _validate_bedrock_region(region)
     body = _build_bedrock_converse_body(messages, model)
     url = (f'https://bedrock-runtime.{region}.amazonaws.com'
            f'/model/{urllib.parse.quote(model, safe="")}/converse-stream')
