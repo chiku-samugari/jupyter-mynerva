@@ -32,9 +32,7 @@
   },
   "bedrock": {
     "allow": [
-      "us.anthropic.claude-sonnet-4-*",
-      "us.anthropic.claude-haiku-4-*",
-      "us.anthropic.claude-opus-4-*"
+      "*"
     ],
     "deny": []
   }
