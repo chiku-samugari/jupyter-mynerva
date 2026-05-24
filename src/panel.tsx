@@ -70,11 +70,17 @@ interface IProvider {
   models: string[];
 }
 
+interface IBedrockRegion {
+  id: string;
+  name: string;
+}
+
 interface IProvidersResponse {
   providers: IProvider[];
   encryption: boolean;
   defaults: IDefaultConfig | null;
   defaultsOnly?: boolean;
+  bedrockRegions: IBedrockRegion[];
 }
 
 async function getProviders(): Promise<IProvidersResponse> {
@@ -369,6 +375,7 @@ async function saveSession(
 interface ISettingsViewProps {
   config: IConfig;
   providers: IProvider[];
+  bedrockRegions: IBedrockRegion[];
   encryption: boolean;
   defaults: IDefaultConfig | null;
   defaultsUnavailable: boolean;
@@ -571,6 +578,7 @@ function EnkiGateSettings({
 function SettingsView({
   config,
   providers,
+  bedrockRegions,
   encryption,
   defaults,
   defaultsUnavailable,
@@ -775,26 +783,11 @@ function SettingsView({
                     value={bedrockRegion}
                     onChange={e => setBedrockRegion(e.target.value)}
                   >
-                    <option value="us-east-1">us-east-1 (N. Virginia)</option>
-                    <option value="us-east-2">us-east-2 (Ohio)</option>
-                    <option value="us-west-2">us-west-2 (Oregon)</option>
-                    <option value="ca-central-1">ca-central-1 (Canada)</option>
-                    <option value="sa-east-1">sa-east-1 (São Paulo)</option>
-                    <option value="eu-west-1">eu-west-1 (Ireland)</option>
-                    <option value="eu-west-2">eu-west-2 (London)</option>
-                    <option value="eu-west-3">eu-west-3 (Paris)</option>
-                    <option value="eu-central-1">eu-central-1 (Frankfurt)</option>
-                    <option value="eu-central-2">eu-central-2 (Zurich)</option>
-                    <option value="eu-north-1">eu-north-1 (Stockholm)</option>
-                    <option value="ap-south-1">ap-south-1 (Mumbai)</option>
-                    <option value="ap-southeast-1">ap-southeast-1 (Singapore)</option>
-                    <option value="ap-southeast-2">ap-southeast-2 (Sydney)</option>
-                    <option value="ap-northeast-1">ap-northeast-1 (Tokyo)</option>
-                    <option value="ap-northeast-2">ap-northeast-2 (Seoul)</option>
-                    <option value="me-south-1">me-south-1 (Bahrain)</option>
-                    <option value="af-south-1">af-south-1 (Cape Town)</option>
-                    <option value="me-central-1">me-central-1 (UAE)</option>
-                    <option value="il-central-1">il-central-1 (Tel Aviv)</option>
+                    {bedrockRegions.map(r => (
+                      <option key={r.id} value={r.id}>
+                        {r.name}
+                      </option>
+                    ))}
                   </select>
                 </div>
               )}
@@ -1225,6 +1218,9 @@ function MynervaComponent({
   liveQuery
 }: IMynervaComponentProps): React.ReactElement {
   const [providers, setProviders] = React.useState<IProvider[]>([]);
+  const [bedrockRegions, setBedrockRegions] = React.useState<IBedrockRegion[]>(
+    []
+  );
   const [encryption, setEncryption] = React.useState(false);
   const [defaults, setDefaults] = React.useState<IDefaultConfig | null>(null);
   const [defaultsOnly, setDefaultsOnly] = React.useState(false);
@@ -1264,6 +1260,7 @@ function MynervaComponent({
     Promise.all([getProviders(), getConfig(), getSessions()])
       .then(async ([providersRes, cfg, sessionsRes]) => {
         setProviders(providersRes.providers);
+        setBedrockRegions(providersRes.bedrockRegions || []);
         setEncryption(providersRes.encryption);
         setDefaults(providersRes.defaults);
         if (providersRes.defaultsOnly) {
@@ -2158,6 +2155,7 @@ function MynervaComponent({
         <SettingsView
           config={config || defaultConfig}
           providers={providers}
+          bedrockRegions={bedrockRegions}
           encryption={encryption}
           defaults={defaults}
           defaultsUnavailable={!!(config?.useDefault && !defaults)}

@@ -241,8 +241,18 @@ _bedrock_models_cache = cachetools.TTLCache(maxsize=8, ttl=300)
 _BEDROCK_REGION_RE = re.compile(r'^[a-z]{2}(-[a-z]+-\d+)?$')
 
 
+def _load_bedrock_regions():
+    """Load Bedrock region definitions from regions.json."""
+    spec_file = files('jupyter_mynerva').joinpath('regions.json')
+    with spec_file.open() as f:
+        return json.load(f)['bedrock']
+
+
 def _validate_bedrock_region(region):
     if not _BEDROCK_REGION_RE.match(region):
+        raise ValueError(f'Invalid AWS region: {region}')
+    valid_ids = {r['id'] for r in _load_bedrock_regions()}
+    if region not in valid_ids:
         raise ValueError(f'Invalid AWS region: {region}')
 
 
@@ -503,7 +513,8 @@ class ProvidersHandler(APIHandler):
             'providers': providers,
             'encryption': is_encryption_configured(),
             'defaults': get_default_config(),
-            'filters': filters
+            'filters': filters,
+            'bedrockRegions': _load_bedrock_regions(),
         }
         if _DEFAULT_CONFIG.get('defaults_only'):
             result['defaultsOnly'] = True

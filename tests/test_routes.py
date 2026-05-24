@@ -17,6 +17,7 @@ from jupyter_mynerva.routes import (
     _fetch_bedrock_models,
     _bedrock_models_cache,
     _validate_bedrock_region,
+    _load_bedrock_regions,
     _fetch_chat_models,
     _chat_models_cache,
     _filter_models,
@@ -1546,7 +1547,15 @@ async def test_chat_bedrock_converse_exception_frame():
     assert 'bad input' in errors[0]['error']
 
 
-# --- _validate_bedrock_region ---
+# --- _load_bedrock_regions / _validate_bedrock_region ---
+
+def test_load_bedrock_regions_returns_list_with_id_and_name():
+    regions = _load_bedrock_regions()
+    assert len(regions) > 0
+    for r in regions:
+        assert 'id' in r
+        assert 'name' in r
+
 
 @pytest.mark.parametrize('region', [
     'us-east-1', 'ap-northeast-1', 'eu-central-2', 'me-south-1', 'il-central-1',
@@ -1557,6 +1566,7 @@ def test_validate_bedrock_region_accepts_valid(region):
 
 @pytest.mark.parametrize('region', [
     'evil.com/', '../foo', 'us east 1', 'US-EAST-1', '', 'us-east-1;rm -rf /',
+    'xx-fake-99',
 ])
 def test_validate_bedrock_region_rejects_invalid(region):
     with pytest.raises(ValueError, match='Invalid AWS region'):
