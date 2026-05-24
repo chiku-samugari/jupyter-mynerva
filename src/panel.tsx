@@ -826,11 +826,7 @@ function SettingsView({
                     <button
                       onClick={handleFetchModels}
                       disabled={fetchingModels}
-                      title={
-                        provider === 'bedrock'
-                          ? 'Fetch models from Bedrock'
-                          : 'Fetch models from endpoint'
-                      }
+                      title="Fetch models from endpoint"
                       style={{
                         margin: 0,
                         padding: '4px',
