@@ -241,7 +241,7 @@ Administrators can provide default LLM settings via environment variables. Users
 | `MYNERVA_OPENAI_BASE_URL`   | Default OpenAI-compatible endpoint (e.g. vLLM, Ollama)               |
 | `MYNERVA_ANTHROPIC_API_KEY` | Default Anthropic API key                                            |
 | `MYNERVA_BEDROCK_API_KEY`   | Default Amazon Bedrock short-term or long-term API key (bearer)      |
-| `MYNERVA_BEDROCK_REGION`    | AWS region for Bedrock requests (defaults to `us-east-1`)            |
+| `MYNERVA_BEDROCK_REGION`    | AWS region for Bedrock requests                                      |
 | `MYNERVA_DEFAULT_PROVIDER`  | Default provider (`openai`, `anthropic`, or `bedrock`)               |
 | `MYNERVA_DEFAULT_MODEL`     | Default model name (optional, fetched from endpoint if not set)      |
 | `MYNERVA_DEFAULTS_ONLY`     | Lock LLM settings to admin defaults (hides settings UI)              |
@@ -249,7 +249,7 @@ Administrators can provide default LLM settings via environment variables. Users
 **Provider auto-detection:**
 
 - If only one API key (or base URL) is set, that provider is automatically selected
-- If multiple keys are set, `MYNERVA_DEFAULT_PROVIDER` is required and must name a configured provider
+- If multiple keys are set, `MYNERVA_DEFAULT_PROVIDER` is required
 - If `MYNERVA_OPENAI_BASE_URL` is set without an API key, the `openai` provider is enabled (for endpoints that don't require authentication)
 - When `MYNERVA_OPENAI_BASE_URL` is set and `MYNERVA_DEFAULT_MODEL` is not, the model list is fetched from the endpoint's `/v1/models`
 - When `MYNERVA_BEDROCK_API_KEY` is set and `MYNERVA_DEFAULT_MODEL` is not, the model list is fetched from Bedrock's `/inference-profiles` in the configured region
@@ -260,7 +260,7 @@ Administrators can provide default LLM settings via environment variables. Users
 
 ### Amazon Bedrock (Converse API)
 
-The `bedrock` provider streams responses from Bedrock's Converse Stream API at `https://bedrock-runtime.{region}.amazonaws.com` using bearer-token authentication — a Bedrock short-term (or long-term) API key works directly, with no AWS SigV4 or `boto3` required. This unlocks Claude (and other Converse-only models) which are not available through the Bedrock OpenAI-compatible chat-completions endpoint.
+The `bedrock` provider streams responses from Bedrock's Converse Stream API at `https://bedrock-runtime.{region}.amazonaws.com` using bearer-token authentication.
 
 To use it:
 
@@ -269,9 +269,7 @@ To use it:
 3. Paste your Bedrock API key
 4. Click the refresh icon next to the model dropdown. The list is populated from Bedrock's `/inference-profiles` API, filtered by the bedrock entry in `jupyter_mynerva/models.json`
 
-Extended thinking (reasoning) is enabled automatically for Anthropic-family model IDs (those whose ID contains `claude` or `anthropic`), giving the same UX as the dedicated Anthropic provider. Non-Anthropic Bedrock models are accepted by the chat path but added thinking config is skipped, since those models reject it.
-
-Model IDs are URL-encoded into the request path (e.g. `us.anthropic.claude-sonnet-4-5-20250929-v1:0` → `…/model/us.anthropic.claude-sonnet-4-5-20250929-v1%3A0/converse-stream`). The curated allow-list lives in `jupyter_mynerva/models.json` under the `bedrock` key; widen it there to expose more models.
+Extended thinking (a.k.a reasoning) is enabled automatically for Anthropic-family model IDs (those whose ID contains `claude` or `anthropic`), giving the same UX as the dedicated Anthropic provider.
 
 ### Enki Gate
 
